@@ -175,6 +175,26 @@ class ScanyeClient:
         except Exception as e:
             raise ScanyeRequestError(f"Failed to mark invoices as paid: {e}") from e
 
+    def mark_as_unpaid(self, invoice_ids: List[str]) -> bool:
+        """
+        Marks invoices as unpaid by removing the transfer order date.
+
+        :param invoice_ids: List of invoice IDs to mark as unpaid.
+        :return: True if successful.
+        """
+        url = "/invoices/order-transfer-date"
+        data = {"invoiceIds": invoice_ids}
+
+        headers = self._get_headers()
+        self._log_request("POST", url, json=data, headers=headers)
+        try:
+            response = self._client.post(url, json=data, headers=headers)
+            self._log_response(response)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to mark invoices as unpaid: {e}") from e
+
     def send_to_ksef(self, invoice_ids: List[str]) -> bool:
         """
         Sends invoices to KSeF.

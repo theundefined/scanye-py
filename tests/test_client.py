@@ -65,6 +65,16 @@ def test_mark_as_paid_success():
 
 
 @respx.mock
+def test_mark_as_unpaid_success():
+    respx.post("https://api.scanye.pl/invoices/order-transfer-date").mock(return_value=httpx.Response(200, json={}))
+
+    client = ScanyeClient(token="test-token")
+    result = client.mark_as_unpaid(["123"])
+
+    assert result is True
+
+
+@respx.mock
 def test_send_to_ksef_success():
     respx.post("https://api.scanye.pl/operational-invoices/send-to-ksef?context=InvoicePreview").mock(
         return_value=httpx.Response(200, json={})

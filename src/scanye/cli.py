@@ -144,6 +144,22 @@ def handle_invoices_mark_paid(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def handle_invoices_mark_unpaid(args: argparse.Namespace) -> None:
+    config = load_config()
+    token = config.get("token")
+    if not token:
+        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    client = ScanyeClient(token=token, debug=args.debug)
+    try:
+        client.mark_as_unpaid(args.invoice_ids)
+        print(f"Successfully marked {len(args.invoice_ids)} invoices as unpaid.")
+    except ScanyeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
     config = load_config()
     token = config.get("token")
@@ -218,6 +234,9 @@ def main() -> None:
     paid_parser.add_argument("invoice_ids", nargs="+", help="Invoice IDs to mark as paid")
     paid_parser.add_argument("--date", help="Transfer order date (YYYY-MM-DD), defaults to today")
 
+    unpaid_parser = invoice_subparsers.add_parser("mark-unpaid", help="Mark invoices as unpaid")
+    unpaid_parser.add_argument("invoice_ids", nargs="+", help="Invoice IDs to mark as unpaid")
+
     ksef_parser = invoice_subparsers.add_parser("send-ksef", help="Send invoices to KSeF")
     ksef_parser.add_argument("invoice_ids", nargs="*", help="Specific invoice IDs to send")
     ksef_parser.add_argument("--all", action="store_true", help="Automatically send all unsent sales invoices")
@@ -231,6 +250,8 @@ def main() -> None:
             handle_invoices_list(args)
         elif args.subcommand == "mark-paid":
             handle_invoices_mark_paid(args)
+        elif args.subcommand == "mark-unpaid":
+            handle_invoices_mark_unpaid(args)
         elif args.subcommand == "send-ksef":
             handle_invoices_send_ksef(args)
         else:
