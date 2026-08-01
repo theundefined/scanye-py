@@ -1,9 +1,13 @@
 import argparse
+import io
 import json
+import os
 import sys
+import zipfile
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
+from typing import List, Optional
 
 from .client import ScanyeClient
 from .exceptions import ScanyeError
@@ -14,8 +18,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 def save_config(config: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    os.chmod(CONFIG_DIR, 0o700)
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f)
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def load_config() -> dict:
@@ -28,6 +35,28 @@ def load_config() -> dict:
         return {}
 
 
+def build_client(config: dict, debug: bool) -> ScanyeClient:
+    return ScanyeClient(
+        token=config.get("token"),
+        debug=debug,
+        email=config.get("email"),
+        password=config.get("password"),
+    )
+
+
+def persist_token(config: dict, client: ScanyeClient) -> None:
+    """Save the client's current token if it changed (e.g. after an automatic re-login)."""
+    if client.token and client.token != config.get("token"):
+        config["token"] = client.token
+        save_config(config)
+
+
+def require_credentials(config: dict) -> None:
+    if not config.get("token") and not (config.get("email") and config.get("password")):
+        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
+        sys.exit(1)
+
+
 def handle_login(args: argparse.Namespace) -> None:
     email = args.email
     password = getpass(f"Password for {email}: ")
@@ -35,31 +64,28 @@ def handle_login(args: argparse.Namespace) -> None:
     client = ScanyeClient(debug=args.debug)
     try:
         token = client.login(email, password)
-        save_config({"token": token, "email": email})
-        print("Login successful. Token saved.")
+        config = {"token": token, "email": email}
+
+        answer = input("Save password so expired tokens can be refreshed automatically? [y/N]: ")
+        if answer.strip().lower() in ("y", "yes"):
+            config["password"] = password
+            save_config(config)
+            print("Login successful. Token and password saved.")
+        else:
+            save_config(config)
+            print("Login successful. Token saved.")
     except ScanyeError as e:
         print(f"Login failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def handle_invoices_list(args: argparse.Namespace) -> None:
-    config = load_config()
-    token = config.get("token")
-    if not token:
-        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
-        sys.exit(1)
-
-    is_sales = args.type == "sales"
-    client = ScanyeClient(token=token, debug=args.debug)
-
-    # Handle months filtering
-    months = args.month
+def build_month_filters(months: Optional[List[str]], raw_filter: Optional[str]) -> List[str]:
     filters = ["dateAuthenticated?isNotNull"]
-    if args.unsent:
-        filters.append("annotations.ksef.status?isNull")
+    # Note: "unsent" isn't a real server-side field; callers apply it client-side
+    # after fetching, once ksef_status has been resolved from the raw invoice payload.
 
-    if args.filter:
-        filters.append(args.filter)
+    if raw_filter:
+        filters.append(raw_filter)
     else:
         now = datetime.now()
         if not months:
@@ -74,6 +100,17 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
             sorted_months = sorted(months)
             filters.append(f"annotations.accountingMonth>={sorted_months[0]}")
             filters.append(f"annotations.accountingMonth<={sorted_months[-1]}")
+
+    return filters
+
+
+def handle_invoices_list(args: argparse.Namespace) -> None:
+    config = load_config()
+    require_credentials(config)
+
+    is_sales = args.type == "sales"
+    client = build_client(config, args.debug)
+    filters = build_month_filters(args.month, args.filter)
 
     try:
         # Fetch more if we are filtering client-side
@@ -126,48 +163,45 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        persist_token(config, client)
 
 
 def handle_invoices_mark_paid(args: argparse.Namespace) -> None:
     config = load_config()
-    token = config.get("token")
-    if not token:
-        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
-        sys.exit(1)
+    require_credentials(config)
 
-    client = ScanyeClient(token=token, debug=args.debug)
+    client = build_client(config, args.debug)
     try:
         client.mark_as_paid(args.invoice_ids, transfer_date=args.date)
         print(f"Successfully marked {len(args.invoice_ids)} invoices as paid.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        persist_token(config, client)
 
 
 def handle_invoices_mark_unpaid(args: argparse.Namespace) -> None:
     config = load_config()
-    token = config.get("token")
-    if not token:
-        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
-        sys.exit(1)
+    require_credentials(config)
 
-    client = ScanyeClient(token=token, debug=args.debug)
+    client = build_client(config, args.debug)
     try:
         client.mark_as_unpaid(args.invoice_ids)
         print(f"Successfully marked {len(args.invoice_ids)} invoices as unpaid.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        persist_token(config, client)
 
 
 def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
     config = load_config()
-    token = config.get("token")
-    if not token:
-        print("Not logged in. Run 'scanye login' first.", file=sys.stderr)
-        sys.exit(1)
+    require_credentials(config)
 
-    client = ScanyeClient(token=token, debug=args.debug)
+    client = build_client(config, args.debug)
     invoice_ids = args.invoice_ids or []
 
     try:
@@ -207,6 +241,57 @@ def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        persist_token(config, client)
+
+
+def handle_invoices_download(args: argparse.Namespace) -> None:
+    config = load_config()
+    require_credentials(config)
+
+    if args.invoice_ids and (args.month or args.filter):
+        print("Cannot combine specific invoice IDs with --month/--filter.", file=sys.stderr)
+        sys.exit(1)
+
+    is_sales = args.type == "sales"
+    client = build_client(config, args.debug)
+
+    try:
+        if args.invoice_ids:
+            invoice_ids = args.invoice_ids
+        else:
+            filters = build_month_filters(args.month, args.filter)
+            invoices = client.fetch_invoices(
+                is_sales=is_sales,
+                limit=args.limit,
+                filters=",".join(filters),
+            )
+            invoice_ids = [inv.id for inv in invoices]
+
+        if not invoice_ids:
+            print("No invoices found to download.")
+            return
+
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Downloading {len(invoice_ids)} invoice(s)...")
+        content, filename = client.fetch_printout(invoice_ids)
+
+        if zipfile.is_zipfile(io.BytesIO(content)):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                names = zf.namelist()
+                zf.extractall(output_dir)
+            print(f"Saved {len(names)} file(s) to {output_dir}/")
+        else:
+            path = output_dir / Path(filename).name
+            path.write_bytes(content)
+            print(f"Saved {path}")
+    except ScanyeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        persist_token(config, client)
 
 
 def main() -> None:
@@ -241,6 +326,16 @@ def main() -> None:
     ksef_parser.add_argument("invoice_ids", nargs="*", help="Specific invoice IDs to send")
     ksef_parser.add_argument("--all", action="store_true", help="Automatically send all unsent sales invoices")
 
+    download_parser = invoice_subparsers.add_parser("download", help="Download invoices as PDF")
+    download_parser.add_argument(
+        "invoice_ids", nargs="*", help="Specific invoice IDs to download (omit to use --month/--filter instead)"
+    )
+    download_parser.add_argument("--type", choices=["sales", "purchase"], default="sales", help="Invoice type")
+    download_parser.add_argument("--month", action="append", help="Month(s) to fetch (YYYY-MM), e.g. 2026-07")
+    download_parser.add_argument("--filter", help="Raw filter string for API")
+    download_parser.add_argument("--limit", type=int, default=100, help="Max invoices to download when using filters")
+    download_parser.add_argument("-o", "--output", default=".", help="Output directory (default: current directory)")
+
     args = parser.parse_args()
 
     if args.command == "login":
@@ -254,8 +349,10 @@ def main() -> None:
             handle_invoices_mark_unpaid(args)
         elif args.subcommand == "send-ksef":
             handle_invoices_send_ksef(args)
+        elif args.subcommand == "download":
+            handle_invoices_download(args)
         else:
-            parser.print_help()
+            invoice_parser.print_help()
     else:
         parser.print_help()
 

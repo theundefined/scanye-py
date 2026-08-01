@@ -1,5 +1,7 @@
 import logging
-from typing import Any, Dict, List, Optional
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -9,13 +11,27 @@ from .models import Invoice
 logger = logging.getLogger(__name__)
 
 
+def _parse_filename(content_disposition: str) -> Optional[str]:
+    match = re.search(r'filename="?([^";]+)"?', content_disposition)
+    return match.group(1) if match else None
+
+
 class ScanyeClient:
     BASE_URL = "https://api.scanye.pl"
 
-    def __init__(self, token: Optional[str] = None, debug: bool = False, client_id: Optional[str] = None):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        debug: bool = False,
+        client_id: Optional[str] = None,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         self.token = token
         self.debug = debug
         self.client_id = client_id
+        self.email = email
+        self.password = password
         self._client = httpx.Client(base_url=self.BASE_URL, timeout=30.0)
         if self.debug:
             logging.basicConfig(level=logging.DEBUG)
@@ -34,10 +50,13 @@ class ScanyeClient:
     def _log_response(self, response: httpx.Response) -> None:
         if self.debug:
             logger.debug(f"DEBUG: Response Status: {response.status_code}")
-            try:
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
                 logger.debug(f"DEBUG: Response Body: {response.json()}")
-            except Exception:
+            elif "text" in content_type:
                 logger.debug(f"DEBUG: Response Text: {response.text}")
+            else:
+                logger.debug(f"DEBUG: Response Body: <{len(response.content)} bytes, {content_type or 'unknown type'}>")
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {
@@ -50,11 +69,44 @@ class ScanyeClient:
             headers["authorization"] = f"Scanye {self.token}"
         return headers
 
+    def _reauthenticate(self) -> bool:
+        """Attempt to obtain a fresh token using stored credentials. Returns True on success."""
+        if not self.email or not self.password:
+            return False
+        try:
+            self.login(self.email, self.password)
+            return True
+        except ScanyeError:
+            return False
+
+    def _authenticated_request(
+        self, method: str, url: str, extra_headers: Optional[Dict[str, str]] = None, **kwargs: Any
+    ) -> httpx.Response:
+        headers = self._get_headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        self._log_request(method, url, headers=headers, **kwargs)
+        response = self._client.request(method, url, headers=headers, **kwargs)
+        self._log_response(response)
+
+        if response.status_code == 401 and self._reauthenticate():
+            headers = self._get_headers()
+            if extra_headers:
+                headers.update(extra_headers)
+            self._log_request(method, url, headers=headers, **kwargs)
+            response = self._client.request(method, url, headers=headers, **kwargs)
+            self._log_response(response)
+
+        return response
+
     def _get_client_id(self) -> str:
         if self.client_id:
             return self.client_id
         info = self.get_info()
-        self.client_id = info.get("clientId") or info.get("user", {}).get("clientId")
+        if info.get("authenticated") is False and self._reauthenticate():
+            info = self.get_info()
+        client_id = info.get("clientId") or (info.get("user") or {}).get("clientId")
+        self.client_id = client_id if isinstance(client_id, str) else None
         if not self.client_id:
             raise ScanyeError("Could not determine clientId from user info")
         return self.client_id
@@ -134,11 +186,8 @@ class ScanyeClient:
         if months:
             data["months"] = months
 
-        headers = self._get_headers()
-        self._log_request("POST", url, json=data, headers=headers)
         try:
-            response = self._client.post(url, json=data, headers=headers)
-            self._log_response(response)
+            response = self._authenticated_request("POST", url, json=data)
             response.raise_for_status()
             res_data = response.json()
             if isinstance(res_data, list):
@@ -165,11 +214,8 @@ class ScanyeClient:
 
         data = {"transferDate": transfer_date, "invoiceIds": invoice_ids}
 
-        headers = self._get_headers()
-        self._log_request("POST", url, json=data, headers=headers)
         try:
-            response = self._client.post(url, json=data, headers=headers)
-            self._log_response(response)
+            response = self._authenticated_request("POST", url, json=data)
             response.raise_for_status()
             return True
         except Exception as e:
@@ -185,11 +231,8 @@ class ScanyeClient:
         url = "/invoices/order-transfer-date"
         data = {"invoiceIds": invoice_ids}
 
-        headers = self._get_headers()
-        self._log_request("POST", url, json=data, headers=headers)
         try:
-            response = self._client.post(url, json=data, headers=headers)
-            self._log_response(response)
+            response = self._authenticated_request("POST", url, json=data)
             response.raise_for_status()
             return True
         except Exception as e:
@@ -203,15 +246,82 @@ class ScanyeClient:
         :return: True if successful.
         """
         url = "/operational-invoices/send-to-ksef?context=InvoicePreview"
-        headers = self._get_headers()
-        self._log_request("POST", url, json=invoice_ids, headers=headers)
+
         try:
-            response = self._client.post(url, json=invoice_ids, headers=headers)
-            self._log_response(response)
+            response = self._authenticated_request("POST", url, json=invoice_ids)
             response.raise_for_status()
             return True
         except Exception as e:
             raise ScanyeRequestError(f"Failed to send invoices to KSeF: {e}") from e
+
+    def create_printout(self, invoice_ids: List[str]) -> str:
+        """
+        Requests generation of a printable PDF (single invoice) or ZIP (multiple invoices)
+        for the given invoice IDs. Returns the printout job ID.
+        """
+        url = "/printouts"
+        extra_headers = {"x-app-context": "InvoicesPage", "x-page-path": "/sales-invoices"}
+
+        try:
+            response = self._authenticated_request("POST", url, json=invoice_ids, extra_headers=extra_headers)
+            response.raise_for_status()
+            printout_id = response.json()
+            if not isinstance(printout_id, str):
+                raise ScanyeRequestError("Unexpected response when creating printout")
+            return printout_id
+        except ScanyeError:
+            raise
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to create printout: {e}") from e
+
+    def get_printout_status(self, printout_id: str) -> Dict[str, Any]:
+        """Returns the status of a printout job, e.g. {"status": "Finished", "fileType": "Pdf"}."""
+        url = f"/printouts/{printout_id}"
+        extra_headers = {"x-page-path": "/sales-invoices"}
+
+        try:
+            response = self._authenticated_request("GET", url, extra_headers=extra_headers)
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to get printout status: {e}") from e
+
+    def download_printout(self, printout_id: str) -> Tuple[bytes, str]:
+        """Downloads the finished printout's content. Returns (content, filename)."""
+        url = f"/printouts/{printout_id}/data"
+        extra_headers = {"x-page-path": "/sales-invoices"}
+
+        try:
+            response = self._authenticated_request("GET", url, extra_headers=extra_headers)
+            response.raise_for_status()
+            filename = _parse_filename(response.headers.get("content-disposition", "")) or f"{printout_id}.bin"
+            return response.content, filename
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to download printout: {e}") from e
+
+    def fetch_printout(
+        self, invoice_ids: List[str], poll_interval: float = 1.0, timeout: float = 60.0
+    ) -> Tuple[bytes, str]:
+        """
+        Creates a printout job for the given invoices, waits for it to finish, and downloads
+        its content. Returns (content, filename) — a PDF for a single invoice, a ZIP of PDFs
+        for multiple.
+        """
+        if not invoice_ids:
+            raise ScanyeRequestError("No invoice IDs provided for printout")
+
+        printout_id = self.create_printout(invoice_ids)
+
+        deadline = time.monotonic() + timeout
+        status = self.get_printout_status(printout_id)
+        while status.get("status") != "Finished":
+            if time.monotonic() >= deadline:
+                raise ScanyeRequestError(f"Timed out waiting for printout {printout_id} to finish")
+            time.sleep(poll_interval)
+            status = self.get_printout_status(printout_id)
+
+        return self.download_printout(printout_id)
 
     def __enter__(self) -> "ScanyeClient":
         return self
