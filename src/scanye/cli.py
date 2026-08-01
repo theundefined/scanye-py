@@ -129,14 +129,17 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
             print("No invoices found.")
             return
 
+        # "Client" for sales invoices (the buyer), "Seller" for purchase invoices (the vendor).
+        counterparty_label = "Client" if is_sales else "Seller"
+
         # Header definition based on verbosity
         if args.verbose:
             h1 = f"{'ID':<38} | {'Date':<10} | {'Inv No':<15} | {'Gross':<10} | "
-            h2 = f"{'Paid':<10} | {'Tax No':<12} | {'Email':<25} | {'Payer'}"
+            h2 = f"{'Paid':<10} | {'Tax No':<12} | {'Email':<25} | {counterparty_label}"
             header = h1 + h2
         else:
             h1 = f"{'ID':<38} | {'Date':<10} | {'Inv No':<15} | {'Gross':<10} | "
-            h2 = f"{'Paid Date':<10} | {'Payer':<30} | {'KSeF'}"
+            h2 = f"{'Paid Date':<10} | {counterparty_label:<30} | {'KSeF'}"
             header = h1 + h2
 
         print(header)
@@ -147,17 +150,17 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
             paid_date = inv.transfer_date or "N/A"
 
             if args.verbose:
-                tax_no = inv.payer_tax_no or "N/A"
-                email = (inv.payer_email or "N/A")[:25]
-                payer = inv.payer_name or ""
+                tax_no = inv.counterparty_tax_no or "N/A"
+                email = (inv.counterparty_email or "N/A")[:25]
+                counterparty = inv.counterparty_name or ""
                 p1 = f"{inv.id:<38} | {date:<10} | {inv.invoice_no:<15} | {gross:<10} | "
-                p2 = f"{paid_date:<10} | {tax_no:<12} | {email:<25} | {payer}"
+                p2 = f"{paid_date:<10} | {tax_no:<12} | {email:<25} | {counterparty}"
                 print(p1 + p2)
             else:
-                payer = (inv.payer_name or "")[:30]
+                counterparty = (inv.counterparty_name or "")[:30]
                 ksef = inv.ksef_status or "N/A"
                 p1 = f"{inv.id:<38} | {date:<10} | {inv.invoice_no:<15} | {gross:<10} | "
-                p2 = f"{paid_date:<10} | {payer:<30} | {ksef}"
+                p2 = f"{paid_date:<10} | {counterparty:<30} | {ksef}"
                 print(p1 + p2)
 
     except ScanyeError as e:

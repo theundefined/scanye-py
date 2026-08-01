@@ -22,7 +22,7 @@ def test_invoice_from_dict():
     assert invoice.id == "123"
     assert invoice.invoice_no == "FV/2026/01"
     assert invoice.is_sales is True
-    assert invoice.payer_name == "Test Payer"
+    assert invoice.counterparty_name == "Test Payer"
     assert invoice.issue_date == "2026-05-01"
     assert invoice.gross_amount == "123.45"
     assert invoice.ksef_status == "SENT"
@@ -59,3 +59,21 @@ def test_invoice_from_dict_ksef_sending_status():
     assert invoice.id == "789"
     assert invoice.ksef_status == "QUEUED"
     assert invoice.ksef_reference == "REF-QUEUED"
+
+
+def test_invoice_from_dict_purchase_shows_seller_as_counterparty():
+    data = {
+        "id": "999",
+        "data": {
+            "invoiceNo": {"value": "FV/2026/02"},
+            "accounting": {"sales": {"value": "false"}},
+            "payer": {"name": {"value": "My Own Company"}, "taxNo": {"value": "1111111111"}},
+            "payee": {"name": {"value": "Some Vendor"}, "taxNo": {"value": "2222222222"}},
+        },
+    }
+
+    invoice = Invoice.from_dict(data)
+
+    assert invoice.is_sales is False
+    assert invoice.counterparty_name == "Some Vendor"
+    assert invoice.counterparty_tax_no == "2222222222"

@@ -7,9 +7,10 @@ class Invoice:
     id: str
     invoice_no: str
     is_sales: bool
-    payer_name: Optional[str]
-    payer_tax_no: Optional[str]
-    payer_email: Optional[str]
+    # The other party on the invoice: the buyer for sales invoices, the seller for purchase invoices.
+    counterparty_name: Optional[str]
+    counterparty_tax_no: Optional[str]
+    counterparty_email: Optional[str]
     issue_date: Optional[str]
     due_date: Optional[str]
     transfer_date: Optional[str]
@@ -58,17 +59,26 @@ class Invoice:
                 ksef_status = "SENT"
 
         invoice_no = get_val(inner_data, "invoiceNo") or ""
-        payer_obj = inner_data.get("payer", {})
-        payer_name = get_val(payer_obj, "name")
-        payer_tax_no = get_val(payer_obj, "taxNo")
 
-        # Email is usually in issuedInvoice for sales or annotations/data for others
-        payer_email = None
+        is_sales = (
+            inner_data.get("accounting", {}).get("sales", {}).get("value") == "true"
+            if isinstance(inner_data.get("accounting", {}).get("sales"), dict)
+            else inner_data.get("accounting", {}).get("sales", False)
+        )
+
+        # "payer" is the buyer and "payee" is the seller; on a sales invoice the buyer is the
+        # counterparty, on a purchase invoice the seller (payee) is.
+        counterparty_obj = inner_data.get("payer", {}) if is_sales else inner_data.get("payee", {})
+        counterparty_name = get_val(counterparty_obj, "name")
+        counterparty_tax_no = get_val(counterparty_obj, "taxNo")
+
+        # Only observed for sales invoices sent via Scanye's own KSeF issuance flow.
+        counterparty_email = None
         issued_invoice = data.get("issuedInvoice", {})
         if isinstance(issued_invoice, dict):
-            payer_email = issued_invoice.get("sentToBuyer", {}).get("email")
-            if not payer_email:
-                payer_email = issued_invoice.get("data", {}).get("buyer", {}).get("email")
+            counterparty_email = issued_invoice.get("sentToBuyer", {}).get("email")
+            if not counterparty_email:
+                counterparty_email = issued_invoice.get("data", {}).get("buyer", {}).get("email")
 
         dates = inner_data.get("dates", {})
         issue_date = get_val(dates, "issue")
@@ -80,14 +90,10 @@ class Invoice:
         return cls(
             id=data.get("id", ""),
             invoice_no=invoice_no,
-            is_sales=(
-                inner_data.get("accounting", {}).get("sales", {}).get("value") == "true"
-                if isinstance(inner_data.get("accounting", {}).get("sales"), dict)
-                else inner_data.get("accounting", {}).get("sales", False)
-            ),
-            payer_name=payer_name,
-            payer_tax_no=payer_tax_no,
-            payer_email=payer_email,
+            is_sales=is_sales,
+            counterparty_name=counterparty_name,
+            counterparty_tax_no=counterparty_tax_no,
+            counterparty_email=counterparty_email,
             issue_date=issue_date,
             due_date=due_date,
             transfer_date=data.get("dateTransferOrdered"),
