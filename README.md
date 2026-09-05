@@ -2,6 +2,8 @@
 
 A Python library and CLI tool for interacting with the Scanye API.
 
+> **Unofficial project.** This library is not created, maintained, sponsored, or endorsed by Scanye. It's a community-built client for the unofficial Scanye API (`api.scanye.pl`), reverse-engineered from the Scanye web app's network traffic. Use at your own risk.
+
 ## Features
 - Login and authentication
 - List sales and purchase invoices
