@@ -186,6 +186,53 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
+def _print_invoice_details(inv: Invoice) -> None:
+    print(f"{inv.invoice_no}  ({'sales' if inv.is_sales else 'purchase'})")
+    print(f"ID: {inv.id}")
+    counterparty_label = "Client" if inv.is_sales else "Seller"
+    print(f"{counterparty_label}: {inv.counterparty_name or 'N/A'} (Tax No: {inv.counterparty_tax_no or 'N/A'})")
+    if inv.counterparty_email:
+        print(f"Email: {inv.counterparty_email}")
+    print(f"Issue date: {inv.issue_date or 'N/A'}    Due date: {inv.due_date or 'N/A'}")
+    currency = inv.currency or ""
+    print(
+        f"Amount: {inv.gross_amount or 'N/A'} {currency} gross "
+        f"({inv.net_amount or 'N/A'} net, {inv.vat_amount or 'N/A'} VAT)"
+    )
+    if inv.payment_method:
+        print(f"Payment method: {inv.payment_method}")
+    print(f"KSeF: {inv.ksef_status or 'N/A'}" + (f" ({inv.ksef_reference})" if inv.ksef_reference else ""))
+    print(f"Paid: {inv.transfer_date or 'Not paid'}")
+    if inv.accounting_month:
+        print(f"Accounting month: {inv.accounting_month}")
+
+    print("\nHistory:")
+    history = inv.history()
+    if not history:
+        print("  No history available.")
+        return
+    for date, operation in history:
+        print(f"  {date:<26} | {operation}")
+
+
+def handle_invoices_show(args: argparse.Namespace) -> None:
+    config = load_config()
+    require_credentials(config)
+
+    client = build_client(config, args.debug)
+    try:
+        invoice = client.get_invoice(args.invoice_id)
+        if not invoice:
+            print(f"Invoice {args.invoice_id} not found.", file=sys.stderr)
+            sys.exit(1)
+        _print_invoice_details(invoice)
+    except ScanyeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        persist_token(config, client)
+
+
 def handle_invoices_mark_paid(args: argparse.Namespace) -> None:
     config = load_config()
     require_credentials(config)
@@ -349,6 +396,9 @@ def main() -> None:
     list_parser.add_argument("--filter", help="Raw filter string for API")
     list_parser.add_argument("-v", "--verbose", action="store_true", help="Show more details (NIP, email)")
 
+    show_parser = invoice_subparsers.add_parser("show", help="Show invoice details and history")
+    show_parser.add_argument("invoice_id", help="Invoice ID to show")
+
     paid_parser = invoice_subparsers.add_parser("mark-paid", help="Mark invoices as paid")
     paid_parser.add_argument("invoice_ids", nargs="+", help="Invoice IDs to mark as paid")
     paid_parser.add_argument("--date", help="Transfer order date (YYYY-MM-DD), defaults to today")
@@ -382,6 +432,8 @@ def main() -> None:
     elif args.command == "invoices":
         if args.subcommand == "list":
             handle_invoices_list(args)
+        elif args.subcommand == "show":
+            handle_invoices_show(args)
         elif args.subcommand == "mark-paid":
             handle_invoices_mark_paid(args)
         elif args.subcommand == "mark-unpaid":

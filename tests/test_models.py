@@ -77,3 +77,47 @@ def test_invoice_from_dict_purchase_shows_seller_as_counterparty():
     assert invoice.is_sales is False
     assert invoice.counterparty_name == "Some Vendor"
     assert invoice.counterparty_tax_no == "2222222222"
+
+
+def test_invoice_history_sorted_chronologically_with_labels():
+    data = {
+        "id": "123",
+        "dateCreated": "2026-07-31T19:15:41.906358",
+        "dateSentToAccounting": "2026-07-31T19:15:42.022917",
+        "dateExported": "2026-08-14T17:17:34.376362",
+        "dateSentToBuyer": "2026-08-31T17:36:00.285586",
+        "dateTransferOrdered": "2026-09-01",
+        "exportTarget": "RachmistrzNexo",
+        "issuedInvoice": {
+            "sentToKsef": {"dateSend": "2026-07-31T19:15:57.38307", "ksefReferenceNumber": "REF-1"},
+            "sentToBuyer": {"date": "2026-08-31T17:36:00.285586", "email": "buyer@example.com"},
+        },
+        "data": {
+            "invoiceNo": {"value": "FV/2026/01"},
+            "accounting": {"sales": {"value": "true"}},
+        },
+    }
+
+    invoice = Invoice.from_dict(data)
+    history = invoice.history()
+
+    assert history == [
+        ("2026-07-31T19:15:41.906358", "Utworzono"),
+        ("2026-07-31T19:15:42.022917", "Wysłano do księgowości"),
+        ("2026-07-31T19:15:57.38307", "Wysłano do KSeF (nr: REF-1)"),
+        ("2026-08-14T17:17:34.376362", "Wyeksportowano (RachmistrzNexo)"),
+        ("2026-08-31T17:36:00.285586", "Wysłano do nabywcy e-mailem (buyer@example.com)"),
+        ("2026-09-01", "Oznaczono jako zapłacona"),
+    ]
+
+
+def test_invoice_history_skips_missing_dates():
+    data = {
+        "id": "123",
+        "dateCreated": "2026-07-31T19:15:41.906358",
+        "data": {"invoiceNo": {"value": "FV/2026/01"}},
+    }
+
+    invoice = Invoice.from_dict(data)
+
+    assert invoice.history() == [("2026-07-31T19:15:41.906358", "Utworzono")]

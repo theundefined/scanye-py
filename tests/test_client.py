@@ -57,6 +57,44 @@ def test_fetch_invoices_success():
 
 
 @respx.mock
+def test_get_invoice_success():
+    respx.get("https://api.scanye.pl/auth/info").mock(
+        return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+    )
+    mock_data = [
+        {
+            "id": "invoice-1",
+            "data": {
+                "invoiceNo": {"value": "INV-1"},
+                "accounting": {"sales": {"value": "true"}},
+                "payer": {"name": {"value": "Payer 1"}},
+            },
+        }
+    ]
+    route = respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=mock_data))
+
+    client = ScanyeClient(token="test-token")
+    invoice = client.get_invoice("invoice-1")
+
+    assert invoice is not None
+    assert invoice.id == "invoice-1"
+    assert json.loads(route.calls.last.request.content)["filter"] == "id=invoice-1"
+
+
+@respx.mock
+def test_get_invoice_not_found():
+    respx.get("https://api.scanye.pl/auth/info").mock(
+        return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+    )
+    respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=[]))
+
+    client = ScanyeClient(token="test-token")
+    invoice = client.get_invoice("missing-id")
+
+    assert invoice is None
+
+
+@respx.mock
 def test_mark_as_paid_success():
     respx.post("https://api.scanye.pl/invoices/order-transfer-date").mock(return_value=httpx.Response(200, json={}))
 

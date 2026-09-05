@@ -16,6 +16,14 @@ def _parse_filename(content_disposition: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _parse_invoice_list(res_data: Any) -> List[Invoice]:
+    if isinstance(res_data, list):
+        return [Invoice.from_dict(item) for item in res_data]
+    elif isinstance(res_data, dict) and "items" in res_data:
+        return [Invoice.from_dict(item) for item in res_data["items"]]
+    return []
+
+
 class ScanyeClient:
     BASE_URL = "https://api.scanye.pl"
 
@@ -189,14 +197,33 @@ class ScanyeClient:
         try:
             response = self._authenticated_request("POST", url, json=data)
             response.raise_for_status()
-            res_data = response.json()
-            if isinstance(res_data, list):
-                return [Invoice.from_dict(item) for item in res_data]
-            elif isinstance(res_data, dict) and "items" in res_data:
-                return [Invoice.from_dict(item) for item in res_data["items"]]
-            return []
+            return _parse_invoice_list(response.json())
         except Exception as e:
             raise ScanyeRequestError(f"Failed to fetch invoices: {e}") from e
+
+    def get_invoice(self, invoice_id: str) -> Optional[Invoice]:
+        """
+        Fetches a single invoice by ID, regardless of whether it's a sales or purchase invoice.
+
+        :param invoice_id: ID of the invoice to fetch.
+        :return: The invoice, or None if no invoice with that ID exists.
+        """
+        url = "/invoices/fetch"
+        data = {
+            "limit": 1,
+            "offset": 0,
+            "sort": "",
+            "filter": f"id={invoice_id}",
+            "clientIds": [self._get_client_id()],
+        }
+
+        try:
+            response = self._authenticated_request("POST", url, json=data)
+            response.raise_for_status()
+            invoices = _parse_invoice_list(response.json())
+            return invoices[0] if invoices else None
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to fetch invoice {invoice_id}: {e}") from e
 
     def mark_as_paid(self, invoice_ids: List[str], transfer_date: Optional[str] = None) -> bool:
         """

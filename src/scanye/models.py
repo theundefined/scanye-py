@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -15,6 +15,10 @@ class Invoice:
     due_date: Optional[str]
     transfer_date: Optional[str]
     gross_amount: Optional[str]
+    net_amount: Optional[str]
+    vat_amount: Optional[str]
+    currency: Optional[str]
+    payment_method: Optional[str]
     date_authenticated: Optional[str]
     accounting_month: Optional[str]
     ksef_status: Optional[str]
@@ -86,6 +90,8 @@ class Invoice:
 
         amounts = inner_data.get("amounts", {})
         gross_amount = get_val(amounts, "gross")
+        net_amount = get_val(amounts, "net")
+        vat_amount = get_val(amounts, "vat")
 
         return cls(
             id=data.get("id", ""),
@@ -98,6 +104,10 @@ class Invoice:
             due_date=due_date,
             transfer_date=data.get("dateTransferOrdered"),
             gross_amount=gross_amount,
+            net_amount=net_amount,
+            vat_amount=vat_amount,
+            currency=get_val(inner_data, "currency"),
+            payment_method=get_val(inner_data, "paymentMethod"),
             date_authenticated=data.get("dateAuthenticated"),
             accounting_month=annotations.get("accountingMonth"),
             ksef_status=ksef_status,
@@ -105,3 +115,46 @@ class Invoice:
             origin=data.get("origin"),
             raw_data=data,
         )
+
+    def history(self) -> List[Tuple[str, str]]:
+        """
+        Returns (date, operation) entries derived from the raw payload's date* fields
+        (dateCreated, dateSentToKsef, etc.), sorted chronologically. Mirrors the invoice
+        history shown on the invoice detail page in the web app.
+        """
+        raw = self.raw_data
+        issued_invoice = raw.get("issuedInvoice")
+        issued_invoice = issued_invoice if isinstance(issued_invoice, dict) else {}
+
+        entries: List[Tuple[str, str]] = []
+
+        def add(date: Any, label: str) -> None:
+            if date:
+                entries.append((date, label))
+
+        add(raw.get("dateCreated"), "Utworzono")
+        add(raw.get("dateSentToAccounting"), "Wysłano do księgowości")
+        add(raw.get("dateSucceeded"), "Przetworzono")
+        add(raw.get("dateValidated"), "Zweryfikowano")
+        add(raw.get("dateAuthenticated"), "Zautoryzowano")
+
+        sent_to_ksef = issued_invoice.get("sentToKsef")
+        sent_to_ksef = sent_to_ksef if isinstance(sent_to_ksef, dict) else {}
+        ksef_reference = sent_to_ksef.get("ksefReferenceNumber") or self.ksef_reference
+        ksef_label = f"Wysłano do KSeF (nr: {ksef_reference})" if ksef_reference else "Wysłano do KSeF"
+        add(sent_to_ksef.get("dateSend"), ksef_label)
+
+        export_target = raw.get("exportTarget")
+        export_label = f"Wyeksportowano ({export_target})" if export_target else "Wyeksportowano"
+        add(raw.get("dateExported"), export_label)
+
+        sent_to_buyer = issued_invoice.get("sentToBuyer")
+        sent_to_buyer = sent_to_buyer if isinstance(sent_to_buyer, dict) else {}
+        buyer_email = sent_to_buyer.get("email")
+        email_label = f"Wysłano do nabywcy e-mailem ({buyer_email})" if buyer_email else "Wysłano do nabywcy e-mailem"
+        add(raw.get("dateSentToBuyer"), email_label)
+
+        add(self.transfer_date, "Oznaczono jako zapłacona")
+
+        entries.sort(key=lambda entry: entry[0])
+        return entries

@@ -133,6 +133,61 @@ def test_handle_invoices_send_email_success(tmp_path, monkeypatch, capsys):
     assert "Successfully sent invoice invoice-1 to buyer@example.com" in capsys.readouterr().out
 
 
+def test_handle_invoices_show_prints_details_and_history(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    with respx.mock:
+        respx.get("https://api.scanye.pl/auth/info").mock(
+            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+        )
+        respx.post("https://api.scanye.pl/invoices/fetch").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "invoice-1",
+                        "dateCreated": "2026-07-31T19:15:41.906358",
+                        "data": {
+                            "invoiceNo": {"value": "FV/2026/01"},
+                            "accounting": {"sales": {"value": "true"}},
+                            "payer": {"name": {"value": "Test Buyer"}},
+                        },
+                    }
+                ],
+            )
+        )
+
+        args = type("Args", (), {"invoice_id": "invoice-1", "debug": False})()
+        cli.handle_invoices_show(args)
+
+    out = capsys.readouterr().out
+    assert "FV/2026/01" in out
+    assert "Test Buyer" in out
+    assert "Utworzono" in out
+
+
+def test_handle_invoices_show_not_found(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    with respx.mock:
+        respx.get("https://api.scanye.pl/auth/info").mock(
+            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+        )
+        respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=[]))
+
+        args = type("Args", (), {"invoice_id": "missing-id", "debug": False})()
+        with pytest.raises(SystemExit):
+            cli.handle_invoices_show(args)
+
+    assert "not found" in capsys.readouterr().err
+
+
 def _download_args(tmp_path, invoice_ids=None, month=None, output=None):
     return type(
         "Args",
