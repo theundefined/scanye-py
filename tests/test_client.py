@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -84,6 +86,20 @@ def test_send_to_ksef_success():
     result = client.send_to_ksef(["123", "456"])
 
     assert result is True
+
+
+@respx.mock
+def test_send_to_buyer_success():
+    route = respx.post("https://api.scanye.pl/operational-invoices/inv-1/send-to-buyer?context=InvoicesList").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    client = ScanyeClient(token="test-token")
+    result = client.send_to_buyer("inv-1", "buyer@example.com")
+
+    assert result is True
+    assert route.calls.last.request.headers["x-page-path"] == "/sales-invoices"
+    assert json.loads(route.calls.last.request.content) == {"recipient": "buyer@example.com", "saveEmail": True}
 
 
 @respx.mock

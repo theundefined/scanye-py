@@ -254,6 +254,26 @@ class ScanyeClient:
         except Exception as e:
             raise ScanyeRequestError(f"Failed to send invoices to KSeF: {e}") from e
 
+    def send_to_buyer(self, invoice_id: str, recipient: str, save_email: bool = True) -> bool:
+        """
+        Sends an invoice to the buyer by e-mail.
+
+        :param invoice_id: ID of the invoice to send.
+        :param recipient: Recipient e-mail address.
+        :param save_email: Whether to remember this address for the invoice's counterparty.
+        :return: True if successful.
+        """
+        url = f"/operational-invoices/{invoice_id}/send-to-buyer?context=InvoicesList"
+        extra_headers = {"x-page-path": "/sales-invoices"}
+        data = {"recipient": recipient, "saveEmail": save_email}
+
+        try:
+            response = self._authenticated_request("POST", url, json=data, extra_headers=extra_headers)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to send invoice to buyer: {e}") from e
+
     def create_printout(self, invoice_ids: List[str]) -> str:
         """
         Requests generation of a printable PDF (single invoice) or ZIP (multiple invoices)

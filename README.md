@@ -8,6 +8,8 @@ A Python library and CLI tool for interacting with the Scanye API.
 - Login and authentication
 - List sales and purchase invoices
 - Filter invoices by KSeF status
+- Send invoices to KSeF
+- E-mail invoices to buyers
 - Download invoices as PDF
 - CLI for easy access
 
@@ -41,6 +43,11 @@ scanye invoices download --type purchase --month 2026-07 -o ./invoices/2026-07/p
 Download a single invoice by ID:
 ```bash
 scanye invoices download <invoice-id> -o ./invoices
+```
+
+E-mail an invoice to its buyer:
+```bash
+scanye invoices send-email <invoice-id> --to buyer@example.com
 ```
 
 ## Library Usage

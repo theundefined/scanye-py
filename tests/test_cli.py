@@ -111,6 +111,28 @@ def test_persist_token_saves_only_on_change(tmp_path, monkeypatch):
     assert cli.load_config()["token"] == "new-token"
 
 
+def test_handle_invoices_send_email_success(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    with respx.mock:
+        route = respx.post(
+            "https://api.scanye.pl/operational-invoices/invoice-1/send-to-buyer?context=InvoicesList"
+        ).mock(return_value=httpx.Response(200, json={}))
+
+        args = type(
+            "Args",
+            (),
+            {"invoice_id": "invoice-1", "to": "buyer@example.com", "no_save_email": False, "debug": False},
+        )()
+        cli.handle_invoices_send_email(args)
+
+    assert route.called
+    assert "Successfully sent invoice invoice-1 to buyer@example.com" in capsys.readouterr().out
+
+
 def _download_args(tmp_path, invoice_ids=None, month=None, output=None):
     return type(
         "Args",

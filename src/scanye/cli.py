@@ -264,6 +264,21 @@ def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
+def handle_invoices_send_email(args: argparse.Namespace) -> None:
+    config = load_config()
+    require_credentials(config)
+
+    client = build_client(config, args.debug)
+    try:
+        client.send_to_buyer(args.invoice_id, args.to, save_email=not args.no_save_email)
+        print(f"Successfully sent invoice {args.invoice_id} to {args.to}.")
+    except ScanyeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        persist_token(config, client)
+
+
 def handle_invoices_download(args: argparse.Namespace) -> None:
     config = load_config()
     require_credentials(config)
@@ -345,6 +360,11 @@ def main() -> None:
     ksef_parser.add_argument("invoice_ids", nargs="*", help="Specific invoice IDs to send")
     ksef_parser.add_argument("--all", action="store_true", help="Automatically send all unsent sales invoices")
 
+    email_parser = invoice_subparsers.add_parser("send-email", help="Send an invoice to its buyer by e-mail")
+    email_parser.add_argument("invoice_id", help="Invoice ID to send")
+    email_parser.add_argument("--to", required=True, help="Recipient e-mail address")
+    email_parser.add_argument("--no-save-email", action="store_true", help="Don't remember this address for next time")
+
     download_parser = invoice_subparsers.add_parser("download", help="Download invoices as PDF")
     download_parser.add_argument(
         "invoice_ids", nargs="*", help="Specific invoice IDs to download (omit to use --month/--filter instead)"
@@ -368,6 +388,8 @@ def main() -> None:
             handle_invoices_mark_unpaid(args)
         elif args.subcommand == "send-ksef":
             handle_invoices_send_ksef(args)
+        elif args.subcommand == "send-email":
+            handle_invoices_send_email(args)
         elif args.subcommand == "download":
             handle_invoices_download(args)
         else:
