@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 from datetime import datetime
@@ -11,6 +12,7 @@ from typing import List, Optional
 
 from .client import ScanyeClient
 from .exceptions import ScanyeError
+from .models import Invoice
 
 CONFIG_DIR = Path.home() / ".config" / "scanye"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -104,6 +106,18 @@ def build_month_filters(months: Optional[List[str]], raw_filter: Optional[str]) 
     return filters
 
 
+def _invoice_sort_key(inv: Invoice) -> tuple:
+    try:
+        date_key = datetime.strptime(inv.issue_date or "", "%d.%m.%Y")
+    except ValueError:
+        date_key = datetime.min
+    # Invoice numbers look like "FV/26/09/3"; sort by the trailing sequence number
+    # numerically so "10" sorts after "9" instead of before it lexicographically.
+    match = re.search(r"(\d+)$", inv.invoice_no or "")
+    number_key = int(match.group(1)) if match else 0
+    return (date_key, number_key)
+
+
 def handle_invoices_list(args: argparse.Namespace) -> None:
     config = load_config()
     require_credentials(config)
@@ -120,6 +134,8 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
             limit=fetch_limit,
             filters=",".join(filters) if filters else None,
         )
+
+        invoices.sort(key=_invoice_sort_key, reverse=True)
 
         if args.unsent:
             invoices = [inv for inv in invoices if not inv.ksef_status or inv.ksef_status == "N/A"]

@@ -7,6 +7,41 @@ import pytest
 import respx
 
 from scanye import cli
+from scanye.models import Invoice
+
+
+def _make_invoice(invoice_no: str, issue_date: str) -> Invoice:
+    return Invoice.from_dict(
+        {
+            "id": invoice_no,
+            "data": {
+                "invoiceNo": {"value": invoice_no},
+                "accounting": {"sales": {"value": "true"}},
+                "payer": {"name": {"value": "Test"}},
+                "dates": {"issue": {"value": issue_date}},
+            },
+        }
+    )
+
+
+def test_invoice_sort_key_orders_by_date_then_numeric_invoice_number():
+    # Invoice numbers with the same date must sort numerically ("10" after "2"),
+    # not lexicographically, and dates take priority over invoice numbers.
+    invoices = [
+        _make_invoice("FV/26/09/1", "01.09.2026"),
+        _make_invoice("FV/26/09/10", "01.09.2026"),
+        _make_invoice("FV/26/09/2", "01.09.2026"),
+        _make_invoice("FV/26/08/9", "31.08.2026"),
+    ]
+
+    invoices.sort(key=cli._invoice_sort_key, reverse=True)
+
+    assert [inv.invoice_no for inv in invoices] == [
+        "FV/26/09/10",
+        "FV/26/09/2",
+        "FV/26/09/1",
+        "FV/26/08/9",
+    ]
 
 
 def test_save_config_sets_restrictive_permissions(tmp_path, monkeypatch):
