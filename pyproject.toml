@@ -1,19 +1,39 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=69.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "scanye-py"
 version = "0.1.0"
-description = "A Python library for the Scanye API"
+description = "Unofficial Python library and CLI for the Scanye accounting API"
 readme = "README.md"
 authors = [{ name = "TheUndefined" }]
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = ["scanye", "invoicing", "ksef", "accounting", "api-client"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Accounting",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.27.0",
     "python-dotenv>=1.0.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/theundefined/scanye-py"
+Repository = "https://github.com/theundefined/scanye-py"
+Issues = "https://github.com/theundefined/scanye-py/issues"
 
 [project.scripts]
 scanye = "scanye.cli:main"
@@ -27,6 +47,9 @@ dev = [
     "black>=24.2.0",
     "mypy>=1.9.0",
 ]
+
+[tool.setuptools.package-data]
+scanye = ["py.typed"]
 
 [tool.black]
 line-length = 120
@@ -46,3 +69,5 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 files = "src"
+mypy_path = "src"
+explicit_package_bases = true
