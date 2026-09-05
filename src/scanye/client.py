@@ -208,20 +208,16 @@ class ScanyeClient:
         :param invoice_id: ID of the invoice to fetch.
         :return: The invoice, or None if no invoice with that ID exists.
         """
-        url = "/invoices/fetch"
-        data = {
-            "limit": 1,
-            "offset": 0,
-            "sort": "",
-            "filter": f"id={invoice_id}",
-            "clientIds": [self._get_client_id()],
-        }
+        url = f"/invoices/{invoice_id}"
 
         try:
-            response = self._authenticated_request("POST", url, json=data)
+            response = self._authenticated_request("GET", url)
+            if response.status_code == 404:
+                return None
             response.raise_for_status()
-            invoices = _parse_invoice_list(response.json())
-            return invoices[0] if invoices else None
+            return Invoice.from_dict(response.json())
+        except ScanyeError:
+            raise
         except Exception as e:
             raise ScanyeRequestError(f"Failed to fetch invoice {invoice_id}: {e}") from e
 

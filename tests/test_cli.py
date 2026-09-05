@@ -140,23 +140,18 @@ def test_handle_invoices_show_prints_details_and_history(tmp_path, monkeypatch, 
     cli.save_config({"token": "test-token"})
 
     with respx.mock:
-        respx.get("https://api.scanye.pl/auth/info").mock(
-            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
-        )
-        respx.post("https://api.scanye.pl/invoices/fetch").mock(
+        respx.get("https://api.scanye.pl/invoices/invoice-1").mock(
             return_value=httpx.Response(
                 200,
-                json=[
-                    {
-                        "id": "invoice-1",
-                        "dateCreated": "2026-07-31T19:15:41.906358",
-                        "data": {
-                            "invoiceNo": {"value": "FV/2026/01"},
-                            "accounting": {"sales": {"value": "true"}},
-                            "payer": {"name": {"value": "Test Buyer"}},
-                        },
-                    }
-                ],
+                json={
+                    "id": "invoice-1",
+                    "dateCreated": "2026-07-31T19:15:41.906358",
+                    "data": {
+                        "invoiceNo": {"value": "FV/2026/01"},
+                        "accounting": {"sales": {"value": "true"}},
+                        "payer": {"name": {"value": "Test Buyer"}},
+                    },
+                },
             )
         )
 
@@ -176,10 +171,9 @@ def test_handle_invoices_show_not_found(tmp_path, monkeypatch, capsys):
     cli.save_config({"token": "test-token"})
 
     with respx.mock:
-        respx.get("https://api.scanye.pl/auth/info").mock(
-            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+        respx.get("https://api.scanye.pl/invoices/missing-id").mock(
+            return_value=httpx.Response(404, json={"message": "Invoice 'missing-id' not found"})
         )
-        respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=[]))
 
         args = type("Args", (), {"invoice_id": "missing-id", "debug": False})()
         with pytest.raises(SystemExit):
