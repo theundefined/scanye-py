@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scanye-py"
-version = "0.2.0"
+version = "0.2.1"
 description = "Unofficial Python library and CLI for the Scanye accounting API"
 readme = "README.md"
 authors = [{ name = "TheUndefined" }]
