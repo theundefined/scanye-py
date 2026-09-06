@@ -118,17 +118,41 @@ def _invoice_sort_key(inv: Invoice) -> tuple:
     return (date_key, number_key)
 
 
+def _trim_to_full_days(invoices: List[Invoice], limit: int) -> List[Invoice]:
+    """
+    Returns at most `limit` invoices (already sorted newest first), but never splits the
+    invoices issued on one day between kept and dropped. The server has no defined tie-break
+    for same-day invoices, so cutting off mid-day would show an arbitrary subset of that day
+    rather than a meaningful "most recent N" -- better to show fewer, ending on a full day.
+    """
+    if len(invoices) <= limit:
+        return invoices
+    boundary_date = invoices[limit - 1].issue_date
+    if invoices[limit].issue_date != boundary_date:
+        return invoices[:limit]
+    trimmed = [inv for inv in invoices[:limit] if inv.issue_date != boundary_date]
+    return trimmed or invoices[:limit]
+
+
 def handle_invoices_list(args: argparse.Namespace) -> None:
     config = load_config()
     require_credentials(config)
 
     is_sales = args.type == "sales"
     client = build_client(config, args.debug)
-    filters = build_month_filters(args.month, args.filter)
+    # Default to the current accounting month rather than a raw invoice count, so the
+    # displayed set has a meaningful boundary instead of an arbitrary server-side cutoff.
+    months = args.month or [datetime.now().strftime("%Y-%m")]
+    filters = build_month_filters(months, args.filter)
+
+    display_limit = args.limit or (10 if args.unsent else None)
 
     try:
-        # Fetch more if we are filtering client-side
-        fetch_limit = args.limit * 5 if args.unsent else args.limit
+        if display_limit:
+            fetch_limit = display_limit * 5 if args.unsent else display_limit + 20
+        else:
+            fetch_limit = 1000
+
         invoices = client.fetch_invoices(
             is_sales=is_sales,
             limit=fetch_limit,
@@ -139,7 +163,9 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
 
         if args.unsent:
             invoices = [inv for inv in invoices if not inv.ksef_status or inv.ksef_status == "N/A"]
-            invoices = invoices[: args.limit]
+
+        if display_limit:
+            invoices = _trim_to_full_days(invoices, display_limit)
 
         if not invoices:
             print("No invoices found.")
@@ -390,9 +416,13 @@ def main() -> None:
 
     list_parser = invoice_subparsers.add_parser("list", help="List invoices")
     list_parser.add_argument("--type", choices=["sales", "purchase"], default="sales", help="Invoice type")
-    list_parser.add_argument("--limit", type=int, default=10, help="Limit number of invoices")
+    list_parser.add_argument(
+        "--limit", type=int, default=None, help="Max invoices to show (default: no cap; whole month is shown)"
+    )
     list_parser.add_argument("--unsent", action="store_true", help="List only unsent to KSeF")
-    list_parser.add_argument("--month", action="append", help="Month(s) to fetch (YYYY-MM), e.g. 2026-05")
+    list_parser.add_argument(
+        "--month", action="append", help="Month(s) to fetch (YYYY-MM), e.g. 2026-05. Default: current month"
+    )
     list_parser.add_argument("--filter", help="Raw filter string for API")
     list_parser.add_argument("-v", "--verbose", action="store_true", help="Show more details (NIP, email)")
 

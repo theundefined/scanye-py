@@ -1,6 +1,8 @@
 import io
+import json
 import stat
 import zipfile
+from datetime import datetime
 
 import httpx
 import pytest
@@ -42,6 +44,46 @@ def test_invoice_sort_key_orders_by_date_then_numeric_invoice_number():
         "FV/26/09/1",
         "FV/26/08/9",
     ]
+
+
+def test_trim_to_full_days_returns_all_when_under_limit():
+    invoices = [_make_invoice("FV/1", "02.09.2026"), _make_invoice("FV/2", "01.09.2026")]
+
+    assert cli._trim_to_full_days(invoices, 5) == invoices
+
+
+def test_trim_to_full_days_keeps_limit_when_boundary_is_a_full_day():
+    invoices = [
+        _make_invoice("FV/1", "02.09.2026"),
+        _make_invoice("FV/2", "01.09.2026"),
+        _make_invoice("FV/3", "31.08.2026"),
+    ]
+
+    assert [inv.invoice_no for inv in cli._trim_to_full_days(invoices, 2)] == ["FV/1", "FV/2"]
+
+
+def test_trim_to_full_days_drops_partial_day_at_the_boundary():
+    invoices = [
+        _make_invoice("FV/1", "02.09.2026"),
+        _make_invoice("FV/2", "01.09.2026"),
+        _make_invoice("FV/3", "01.09.2026"),
+        _make_invoice("FV/4", "31.08.2026"),
+    ]
+
+    # limit=2 would otherwise cut FV/2 and FV/3 (both 01.09.2026) in half -- drop the whole day.
+    assert [inv.invoice_no for inv in cli._trim_to_full_days(invoices, 2)] == ["FV/1"]
+
+
+def test_trim_to_full_days_falls_back_to_raw_slice_if_trimming_empties_it():
+    invoices = [
+        _make_invoice("FV/1", "01.09.2026"),
+        _make_invoice("FV/2", "01.09.2026"),
+        _make_invoice("FV/3", "01.09.2026"),
+    ]
+
+    # Every fetched invoice shares the boundary date -- trimming it away would leave nothing,
+    # so fall back to the plain slice rather than showing an empty list.
+    assert [inv.invoice_no for inv in cli._trim_to_full_days(invoices, 2)] == ["FV/1", "FV/2"]
 
 
 def test_save_config_sets_restrictive_permissions(tmp_path, monkeypatch):
@@ -131,6 +173,80 @@ def test_handle_invoices_send_email_success(tmp_path, monkeypatch, capsys):
 
     assert route.called
     assert "Successfully sent invoice invoice-1 to buyer@example.com" in capsys.readouterr().out
+
+
+def _list_args(type_="sales", limit=None, unsent=False, month=None, filter_=None, verbose=False):
+    return type(
+        "Args",
+        (),
+        {
+            "type": type_,
+            "limit": limit,
+            "unsent": unsent,
+            "month": month,
+            "filter": filter_,
+            "verbose": verbose,
+            "debug": False,
+        },
+    )()
+
+
+def test_handle_invoices_list_defaults_to_current_month(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 15)
+
+    monkeypatch.setattr(cli, "datetime", FixedDatetime)
+
+    with respx.mock:
+        respx.get("https://api.scanye.pl/auth/info").mock(
+            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+        )
+        route = respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=[]))
+
+        cli.handle_invoices_list(_list_args())
+
+    body = json.loads(route.calls.last.request.content)
+    assert "annotations.accountingMonth>=2026-09" in body["filter"]
+    assert "annotations.accountingMonth<=2026-09" in body["filter"]
+
+
+def test_handle_invoices_list_no_limit_shows_everything_fetched(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    mock_data = [
+        {
+            "id": f"inv-{i}",
+            "data": {
+                "invoiceNo": {"value": f"FV/{i}"},
+                "accounting": {"sales": {"value": "true"}},
+                "payer": {"name": {"value": "Test"}},
+                "dates": {"issue": {"value": "01.09.2026"}},
+            },
+        }
+        for i in range(15)
+    ]
+
+    with respx.mock:
+        respx.get("https://api.scanye.pl/auth/info").mock(
+            return_value=httpx.Response(200, json={"clientId": "test-client-id"})
+        )
+        respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=mock_data))
+
+        cli.handle_invoices_list(_list_args())
+
+    out = capsys.readouterr().out
+    for i in range(15):
+        assert f"FV/{i}" in out
 
 
 def test_handle_invoices_show_prints_details_and_history(tmp_path, monkeypatch, capsys):
