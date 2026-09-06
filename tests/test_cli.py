@@ -7,9 +7,45 @@ from datetime import datetime
 import httpx
 import pytest
 import respx
+from click.testing import CliRunner
 
 from scanye import cli
 from scanye.models import Invoice
+
+
+def test_bare_groups_print_help_and_exit_zero():
+    # cli/invoices are declared with invoke_without_command=True precisely so that running
+    # them with no subcommand prints help and exits 0 (matching the old argparse behavior),
+    # rather than click's default of a usage error (exit code 2).
+    runner = CliRunner()
+    for args in ([], ["invoices"]):
+        result = runner.invoke(cli.cli, args)
+        assert result.exit_code == 0
+        assert "Usage:" in result.output
+
+
+def test_invoices_list_option_wiring_reaches_handler(monkeypatch):
+    # Exercises the click parsing layer itself (option names, --month multiple=True,
+    # the --type/--filter renaming to invoice_type/raw_filter) rather than handle_invoices_list,
+    # which is already covered directly by the tests below.
+    captured = {}
+    monkeypatch.setattr(cli, "handle_invoices_list", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(
+        cli.cli,
+        ["invoices", "list", "--type", "purchase", "--month", "2026-01", "--month", "2026-02", "-v"],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "invoice_type": "purchase",
+        "limit": None,
+        "unsent": False,
+        "month": ["2026-01", "2026-02"],
+        "raw_filter": None,
+        "verbose": True,
+        "debug": False,
+    }
 
 
 def _make_invoice(invoice_no: str, issue_date: str) -> Invoice:
@@ -111,8 +147,7 @@ def test_handle_login_saves_password_when_confirmed(tmp_path, monkeypatch, capsy
         respx.post("https://api.scanye.pl/auth/log-in").mock(
             return_value=httpx.Response(200, json={"apiKey": "fresh-token"})
         )
-        args = type("Args", (), {"email": "test@example.com", "debug": False})()
-        cli.handle_login(args)
+        cli.handle_login(email="test@example.com", debug=False)
 
     config = cli.load_config()
     assert config == {"token": "fresh-token", "email": "test@example.com", "password": "secret-password"}
@@ -129,8 +164,7 @@ def test_handle_login_skips_password_when_declined(tmp_path, monkeypatch):
         respx.post("https://api.scanye.pl/auth/log-in").mock(
             return_value=httpx.Response(200, json={"apiKey": "fresh-token"})
         )
-        args = type("Args", (), {"email": "test@example.com", "debug": False})()
-        cli.handle_login(args)
+        cli.handle_login(email="test@example.com", debug=False)
 
     config = cli.load_config()
     assert config == {"token": "fresh-token", "email": "test@example.com"}
@@ -164,31 +198,22 @@ def test_handle_invoices_send_email_success(tmp_path, monkeypatch, capsys):
             "https://api.scanye.pl/operational-invoices/invoice-1/send-to-buyer?context=InvoicesList"
         ).mock(return_value=httpx.Response(200, json={}))
 
-        args = type(
-            "Args",
-            (),
-            {"invoice_id": "invoice-1", "to": "buyer@example.com", "no_save_email": False, "debug": False},
-        )()
-        cli.handle_invoices_send_email(args)
+        cli.handle_invoices_send_email(invoice_id="invoice-1", to="buyer@example.com", no_save_email=False, debug=False)
 
     assert route.called
     assert "Successfully sent invoice invoice-1 to buyer@example.com" in capsys.readouterr().out
 
 
-def _list_args(type_="sales", limit=None, unsent=False, month=None, filter_=None, verbose=False):
-    return type(
-        "Args",
-        (),
-        {
-            "type": type_,
-            "limit": limit,
-            "unsent": unsent,
-            "month": month,
-            "filter": filter_,
-            "verbose": verbose,
-            "debug": False,
-        },
-    )()
+def _list_kwargs(type_="sales", limit=None, unsent=False, month=None, filter_=None, verbose=False):
+    return {
+        "invoice_type": type_,
+        "limit": limit,
+        "unsent": unsent,
+        "month": month,
+        "raw_filter": filter_,
+        "verbose": verbose,
+        "debug": False,
+    }
 
 
 def test_handle_invoices_list_defaults_to_current_month(tmp_path, monkeypatch):
@@ -210,7 +235,7 @@ def test_handle_invoices_list_defaults_to_current_month(tmp_path, monkeypatch):
         )
         route = respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=[]))
 
-        cli.handle_invoices_list(_list_args())
+        cli.handle_invoices_list(**_list_kwargs())
 
     body = json.loads(route.calls.last.request.content)
     assert "annotations.accountingMonth>=2026-09" in body["filter"]
@@ -242,7 +267,7 @@ def test_handle_invoices_list_no_limit_shows_everything_fetched(tmp_path, monkey
         )
         respx.post("https://api.scanye.pl/invoices/fetch").mock(return_value=httpx.Response(200, json=mock_data))
 
-        cli.handle_invoices_list(_list_args())
+        cli.handle_invoices_list(**_list_kwargs())
 
     out = capsys.readouterr().out
     for i in range(15):
@@ -271,8 +296,7 @@ def test_handle_invoices_show_prints_details_and_history(tmp_path, monkeypatch, 
             )
         )
 
-        args = type("Args", (), {"invoice_id": "invoice-1", "debug": False})()
-        cli.handle_invoices_show(args)
+        cli.handle_invoices_show(invoice_id="invoice-1", debug=False)
 
     out = capsys.readouterr().out
     assert "FV/2026/01" in out
@@ -291,27 +315,22 @@ def test_handle_invoices_show_not_found(tmp_path, monkeypatch, capsys):
             return_value=httpx.Response(404, json={"message": "Invoice 'missing-id' not found"})
         )
 
-        args = type("Args", (), {"invoice_id": "missing-id", "debug": False})()
         with pytest.raises(SystemExit):
-            cli.handle_invoices_show(args)
+            cli.handle_invoices_show(invoice_id="missing-id", debug=False)
 
     assert "not found" in capsys.readouterr().err
 
 
-def _download_args(tmp_path, invoice_ids=None, month=None, output=None):
-    return type(
-        "Args",
-        (),
-        {
-            "invoice_ids": invoice_ids or [],
-            "month": month,
-            "filter": None,
-            "type": "sales",
-            "limit": 100,
-            "output": output or str(tmp_path / "out"),
-            "debug": False,
-        },
-    )()
+def _download_kwargs(tmp_path, invoice_ids=None, month=None, output=None):
+    return {
+        "invoice_ids": invoice_ids or [],
+        "month": month,
+        "raw_filter": None,
+        "invoice_type": "sales",
+        "limit": 100,
+        "output": output or str(tmp_path / "out"),
+        "debug": False,
+    }
 
 
 def test_handle_invoices_download_specific_id_saves_pdf(tmp_path, monkeypatch):
@@ -336,8 +355,8 @@ def test_handle_invoices_download_specific_id_saves_pdf(tmp_path, monkeypatch):
             )
         )
 
-        args = _download_args(tmp_path, invoice_ids=["invoice-1"])
-        cli.handle_invoices_download(args)
+        kwargs = _download_kwargs(tmp_path, invoice_ids=["invoice-1"])
+        cli.handle_invoices_download(**kwargs)
 
     saved = tmp_path / "out" / "invoice_123.pdf"
     assert saved.read_bytes() == b"%PDF-1.4 fake content"
@@ -379,8 +398,8 @@ def test_handle_invoices_download_by_month_extracts_zip(tmp_path, monkeypatch):
             )
         )
 
-        args = _download_args(tmp_path, month=["2026-07"])
-        cli.handle_invoices_download(args)
+        kwargs = _download_kwargs(tmp_path, month=["2026-07"])
+        cli.handle_invoices_download(**kwargs)
 
     assert (tmp_path / "out" / "invoice_1.pdf").read_bytes() == b"pdf-1"
     assert (tmp_path / "out" / "invoice_2.pdf").read_bytes() == b"pdf-2"
@@ -392,6 +411,6 @@ def test_handle_invoices_download_rejects_ids_with_month(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
     cli.save_config({"token": "test-token"})
 
-    args = _download_args(tmp_path, invoice_ids=["invoice-1"], month=["2026-07"])
+    kwargs = _download_kwargs(tmp_path, invoice_ids=["invoice-1"], month=["2026-07"])
     with pytest.raises(SystemExit):
-        cli.handle_invoices_download(args)
+        cli.handle_invoices_download(**kwargs)

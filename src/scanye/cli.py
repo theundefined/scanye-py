@@ -1,4 +1,3 @@
-import argparse
 import io
 import json
 import os
@@ -9,6 +8,8 @@ from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 from typing import List, Optional
+
+import click
 
 from .client import ScanyeClient
 from .exceptions import ScanyeError
@@ -59,11 +60,10 @@ def require_credentials(config: dict) -> None:
         sys.exit(1)
 
 
-def handle_login(args: argparse.Namespace) -> None:
-    email = args.email
+def handle_login(email: str, debug: bool) -> None:
     password = getpass(f"Password for {email}: ")
 
-    client = ScanyeClient(debug=args.debug)
+    client = ScanyeClient(debug=debug)
     try:
         token = client.login(email, password)
         config = {"token": token, "email": email}
@@ -134,22 +134,30 @@ def _trim_to_full_days(invoices: List[Invoice], limit: int) -> List[Invoice]:
     return trimmed or invoices[:limit]
 
 
-def handle_invoices_list(args: argparse.Namespace) -> None:
+def handle_invoices_list(
+    invoice_type: str,
+    limit: Optional[int],
+    unsent: bool,
+    month: Optional[List[str]],
+    raw_filter: Optional[str],
+    verbose: bool,
+    debug: bool,
+) -> None:
     config = load_config()
     require_credentials(config)
 
-    is_sales = args.type == "sales"
-    client = build_client(config, args.debug)
+    is_sales = invoice_type == "sales"
+    client = build_client(config, debug)
     # Default to the current accounting month rather than a raw invoice count, so the
     # displayed set has a meaningful boundary instead of an arbitrary server-side cutoff.
-    months = args.month or [datetime.now().strftime("%Y-%m")]
-    filters = build_month_filters(months, args.filter)
+    months = month or [datetime.now().strftime("%Y-%m")]
+    filters = build_month_filters(months, raw_filter)
 
-    display_limit = args.limit or (10 if args.unsent else None)
+    display_limit = limit or (10 if unsent else None)
 
     try:
         if display_limit:
-            fetch_limit = display_limit * 5 if args.unsent else display_limit + 20
+            fetch_limit = display_limit * 5 if unsent else display_limit + 20
         else:
             fetch_limit = 1000
 
@@ -161,7 +169,7 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
 
         invoices.sort(key=_invoice_sort_key, reverse=True)
 
-        if args.unsent:
+        if unsent:
             invoices = [inv for inv in invoices if not inv.ksef_status or inv.ksef_status == "N/A"]
 
         if display_limit:
@@ -175,7 +183,7 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
         counterparty_label = "Client" if is_sales else "Seller"
 
         # Header definition based on verbosity
-        if args.verbose:
+        if verbose:
             h1 = f"{'ID':<38} | {'Date':<10} | {'Inv No':<15} | {'Gross':<10} | "
             h2 = f"{'Paid':<10} | {'Tax No':<12} | {'Email':<25} | {counterparty_label}"
             header = h1 + h2
@@ -191,7 +199,7 @@ def handle_invoices_list(args: argparse.Namespace) -> None:
             gross = inv.gross_amount or "0.00"
             paid_date = inv.transfer_date or "N/A"
 
-            if args.verbose:
+            if verbose:
                 tax_no = inv.counterparty_tax_no or "N/A"
                 email = (inv.counterparty_email or "N/A")[:25]
                 counterparty = inv.counterparty_name or ""
@@ -241,15 +249,15 @@ def _print_invoice_details(inv: Invoice) -> None:
         print(f"  {date:<26} | {operation}")
 
 
-def handle_invoices_show(args: argparse.Namespace) -> None:
+def handle_invoices_show(invoice_id: str, debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
-    client = build_client(config, args.debug)
+    client = build_client(config, debug)
     try:
-        invoice = client.get_invoice(args.invoice_id)
+        invoice = client.get_invoice(invoice_id)
         if not invoice:
-            print(f"Invoice {args.invoice_id} not found.", file=sys.stderr)
+            print(f"Invoice {invoice_id} not found.", file=sys.stderr)
             sys.exit(1)
         _print_invoice_details(invoice)
     except ScanyeError as e:
@@ -259,14 +267,14 @@ def handle_invoices_show(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_mark_paid(args: argparse.Namespace) -> None:
+def handle_invoices_mark_paid(invoice_ids: List[str], date: Optional[str], debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
-    client = build_client(config, args.debug)
+    client = build_client(config, debug)
     try:
-        client.mark_as_paid(args.invoice_ids, transfer_date=args.date)
-        print(f"Successfully marked {len(args.invoice_ids)} invoices as paid.")
+        client.mark_as_paid(invoice_ids, transfer_date=date)
+        print(f"Successfully marked {len(invoice_ids)} invoices as paid.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -274,14 +282,14 @@ def handle_invoices_mark_paid(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_mark_unpaid(args: argparse.Namespace) -> None:
+def handle_invoices_mark_unpaid(invoice_ids: List[str], debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
-    client = build_client(config, args.debug)
+    client = build_client(config, debug)
     try:
-        client.mark_as_unpaid(args.invoice_ids)
-        print(f"Successfully marked {len(args.invoice_ids)} invoices as unpaid.")
+        client.mark_as_unpaid(invoice_ids)
+        print(f"Successfully marked {len(invoice_ids)} invoices as unpaid.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -289,15 +297,15 @@ def handle_invoices_mark_unpaid(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
+def handle_invoices_send_ksef(invoice_ids: List[str], send_all: bool, debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
-    client = build_client(config, args.debug)
-    invoice_ids = args.invoice_ids or []
+    client = build_client(config, debug)
+    invoice_ids = invoice_ids or []
 
     try:
-        if args.all:
+        if send_all:
             print("Searching for unsent sales invoices...")
             # Fetch invoices from last few months to be safe
             now = datetime.now()
@@ -337,14 +345,14 @@ def handle_invoices_send_ksef(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_send_email(args: argparse.Namespace) -> None:
+def handle_invoices_send_email(invoice_id: str, to: str, no_save_email: bool, debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
-    client = build_client(config, args.debug)
+    client = build_client(config, debug)
     try:
-        client.send_to_buyer(args.invoice_id, args.to, save_email=not args.no_save_email)
-        print(f"Successfully sent invoice {args.invoice_id} to {args.to}.")
+        client.send_to_buyer(invoice_id, to, save_email=not no_save_email)
+        print(f"Successfully sent invoice {invoice_id} to {to}.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -352,25 +360,31 @@ def handle_invoices_send_email(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_download(args: argparse.Namespace) -> None:
+def handle_invoices_download(
+    invoice_ids: List[str],
+    invoice_type: str,
+    month: Optional[List[str]],
+    raw_filter: Optional[str],
+    limit: int,
+    output: str,
+    debug: bool,
+) -> None:
     config = load_config()
     require_credentials(config)
 
-    if args.invoice_ids and (args.month or args.filter):
+    if invoice_ids and (month or raw_filter):
         print("Cannot combine specific invoice IDs with --month/--filter.", file=sys.stderr)
         sys.exit(1)
 
-    is_sales = args.type == "sales"
-    client = build_client(config, args.debug)
+    is_sales = invoice_type == "sales"
+    client = build_client(config, debug)
 
     try:
-        if args.invoice_ids:
-            invoice_ids = args.invoice_ids
-        else:
-            filters = build_month_filters(args.month, args.filter)
+        if not invoice_ids:
+            filters = build_month_filters(month, raw_filter)
             invoices = client.fetch_invoices(
                 is_sales=is_sales,
-                limit=args.limit,
+                limit=limit,
                 filters=",".join(filters),
             )
             invoice_ids = [inv.id for inv in invoices]
@@ -379,7 +393,7 @@ def handle_invoices_download(args: argparse.Namespace) -> None:
             print("No invoices found to download.")
             return
 
-        output_dir = Path(args.output)
+        output_dir = Path(output)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Downloading {len(invoice_ids)} invoice(s)...")
@@ -401,83 +415,136 @@ def handle_invoices_download(args: argparse.Namespace) -> None:
         persist_token(config, client)
 
 
+@click.group(invoke_without_command=True)
+@click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.pass_context
+def cli(ctx: click.Context, debug: bool) -> None:
+    """Scanye CLI tool"""
+    ctx.obj = debug
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@cli.command()
+@click.option("--email", required=True, help="Your Scanye email")
+@click.pass_obj
+def login(debug: bool, email: str) -> None:
+    """Login to Scanye"""
+    handle_login(email, debug)
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def invoices(ctx: click.Context) -> None:
+    """Invoice operations"""
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@invoices.command(name="list")
+@click.option("--type", "invoice_type", type=click.Choice(["sales", "purchase"]), default="sales", help="Invoice type")
+@click.option("--limit", type=int, default=None, help="Max invoices to show (default: no cap; whole month is shown)")
+@click.option("--unsent", is_flag=True, help="List only unsent to KSeF")
+@click.option("--month", multiple=True, help="Month(s) to fetch (YYYY-MM), e.g. 2026-05. Default: current month")
+@click.option("--filter", "raw_filter", help="Raw filter string for API")
+@click.option("-v", "--verbose", is_flag=True, help="Show more details (NIP, email)")
+@click.pass_obj
+def invoices_list(
+    debug: bool,
+    invoice_type: str,
+    limit: Optional[int],
+    unsent: bool,
+    month: tuple,
+    raw_filter: Optional[str],
+    verbose: bool,
+) -> None:
+    """List invoices"""
+    handle_invoices_list(
+        invoice_type=invoice_type,
+        limit=limit,
+        unsent=unsent,
+        month=list(month) if month else None,
+        raw_filter=raw_filter,
+        verbose=verbose,
+        debug=debug,
+    )
+
+
+@invoices.command(name="show")
+@click.argument("invoice_id")
+@click.pass_obj
+def invoices_show(debug: bool, invoice_id: str) -> None:
+    """Show invoice details and history"""
+    handle_invoices_show(invoice_id, debug)
+
+
+@invoices.command(name="mark-paid")
+@click.argument("invoice_ids", nargs=-1, required=True)
+@click.option("--date", help="Transfer order date (YYYY-MM-DD), defaults to today")
+@click.pass_obj
+def invoices_mark_paid(debug: bool, invoice_ids: tuple, date: Optional[str]) -> None:
+    """Mark invoices as paid"""
+    handle_invoices_mark_paid(list(invoice_ids), date, debug)
+
+
+@invoices.command(name="mark-unpaid")
+@click.argument("invoice_ids", nargs=-1, required=True)
+@click.pass_obj
+def invoices_mark_unpaid(debug: bool, invoice_ids: tuple) -> None:
+    """Mark invoices as unpaid"""
+    handle_invoices_mark_unpaid(list(invoice_ids), debug)
+
+
+@invoices.command(name="send-ksef")
+@click.argument("invoice_ids", nargs=-1)
+@click.option("--all", "send_all", is_flag=True, help="Automatically send all unsent sales invoices")
+@click.pass_obj
+def invoices_send_ksef(debug: bool, invoice_ids: tuple, send_all: bool) -> None:
+    """Send invoices to KSeF"""
+    handle_invoices_send_ksef(list(invoice_ids), send_all, debug)
+
+
+@invoices.command(name="send-email")
+@click.argument("invoice_id")
+@click.option("--to", required=True, help="Recipient e-mail address")
+@click.option("--no-save-email", is_flag=True, help="Don't remember this address for next time")
+@click.pass_obj
+def invoices_send_email(debug: bool, invoice_id: str, to: str, no_save_email: bool) -> None:
+    """Send an invoice to its buyer by e-mail"""
+    handle_invoices_send_email(invoice_id, to, no_save_email, debug)
+
+
+@invoices.command(name="download")
+@click.argument("invoice_ids", nargs=-1)
+@click.option("--type", "invoice_type", type=click.Choice(["sales", "purchase"]), default="sales", help="Invoice type")
+@click.option("--month", multiple=True, help="Month(s) to fetch (YYYY-MM), e.g. 2026-07")
+@click.option("--filter", "raw_filter", help="Raw filter string for API")
+@click.option("--limit", type=int, default=100, help="Max invoices to download when using filters")
+@click.option("-o", "--output", default=".", help="Output directory (default: current directory)")
+@click.pass_obj
+def invoices_download(
+    debug: bool,
+    invoice_ids: tuple,
+    invoice_type: str,
+    month: tuple,
+    raw_filter: Optional[str],
+    limit: int,
+    output: str,
+) -> None:
+    """Download invoices as PDF"""
+    handle_invoices_download(
+        invoice_ids=list(invoice_ids),
+        invoice_type=invoice_type,
+        month=list(month) if month else None,
+        raw_filter=raw_filter,
+        limit=limit,
+        output=output,
+        debug=debug,
+    )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scanye CLI tool")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    subparsers = parser.add_subparsers(dest="command", help="Commands")
-
-    # Login command
-    login_parser = subparsers.add_parser("login", help="Login to Scanye")
-    login_parser.add_argument("--email", required=True, help="Your Scanye email")
-
-    # Invoices command
-    invoice_parser = subparsers.add_parser("invoices", help="Invoice operations")
-    invoice_subparsers = invoice_parser.add_subparsers(dest="subcommand", help="Invoice subcommands")
-
-    list_parser = invoice_subparsers.add_parser("list", help="List invoices")
-    list_parser.add_argument("--type", choices=["sales", "purchase"], default="sales", help="Invoice type")
-    list_parser.add_argument(
-        "--limit", type=int, default=None, help="Max invoices to show (default: no cap; whole month is shown)"
-    )
-    list_parser.add_argument("--unsent", action="store_true", help="List only unsent to KSeF")
-    list_parser.add_argument(
-        "--month", action="append", help="Month(s) to fetch (YYYY-MM), e.g. 2026-05. Default: current month"
-    )
-    list_parser.add_argument("--filter", help="Raw filter string for API")
-    list_parser.add_argument("-v", "--verbose", action="store_true", help="Show more details (NIP, email)")
-
-    show_parser = invoice_subparsers.add_parser("show", help="Show invoice details and history")
-    show_parser.add_argument("invoice_id", help="Invoice ID to show")
-
-    paid_parser = invoice_subparsers.add_parser("mark-paid", help="Mark invoices as paid")
-    paid_parser.add_argument("invoice_ids", nargs="+", help="Invoice IDs to mark as paid")
-    paid_parser.add_argument("--date", help="Transfer order date (YYYY-MM-DD), defaults to today")
-
-    unpaid_parser = invoice_subparsers.add_parser("mark-unpaid", help="Mark invoices as unpaid")
-    unpaid_parser.add_argument("invoice_ids", nargs="+", help="Invoice IDs to mark as unpaid")
-
-    ksef_parser = invoice_subparsers.add_parser("send-ksef", help="Send invoices to KSeF")
-    ksef_parser.add_argument("invoice_ids", nargs="*", help="Specific invoice IDs to send")
-    ksef_parser.add_argument("--all", action="store_true", help="Automatically send all unsent sales invoices")
-
-    email_parser = invoice_subparsers.add_parser("send-email", help="Send an invoice to its buyer by e-mail")
-    email_parser.add_argument("invoice_id", help="Invoice ID to send")
-    email_parser.add_argument("--to", required=True, help="Recipient e-mail address")
-    email_parser.add_argument("--no-save-email", action="store_true", help="Don't remember this address for next time")
-
-    download_parser = invoice_subparsers.add_parser("download", help="Download invoices as PDF")
-    download_parser.add_argument(
-        "invoice_ids", nargs="*", help="Specific invoice IDs to download (omit to use --month/--filter instead)"
-    )
-    download_parser.add_argument("--type", choices=["sales", "purchase"], default="sales", help="Invoice type")
-    download_parser.add_argument("--month", action="append", help="Month(s) to fetch (YYYY-MM), e.g. 2026-07")
-    download_parser.add_argument("--filter", help="Raw filter string for API")
-    download_parser.add_argument("--limit", type=int, default=100, help="Max invoices to download when using filters")
-    download_parser.add_argument("-o", "--output", default=".", help="Output directory (default: current directory)")
-
-    args = parser.parse_args()
-
-    if args.command == "login":
-        handle_login(args)
-    elif args.command == "invoices":
-        if args.subcommand == "list":
-            handle_invoices_list(args)
-        elif args.subcommand == "show":
-            handle_invoices_show(args)
-        elif args.subcommand == "mark-paid":
-            handle_invoices_mark_paid(args)
-        elif args.subcommand == "mark-unpaid":
-            handle_invoices_mark_unpaid(args)
-        elif args.subcommand == "send-ksef":
-            handle_invoices_send_ksef(args)
-        elif args.subcommand == "send-email":
-            handle_invoices_send_email(args)
-        elif args.subcommand == "download":
-            handle_invoices_download(args)
-        else:
-            invoice_parser.print_help()
-    else:
-        parser.print_help()
+    cli()
 
 
 if __name__ == "__main__":

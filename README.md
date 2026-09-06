@@ -56,6 +56,14 @@ E-mail an invoice to its buyer:
 scanye invoices send-email <invoice-id> --to buyer@example.com
 ```
 
+### Shell completion
+
+The CLI is built on [click](https://click.palletsprojects.com/), which provides tab-completion of commands, options, and choice values (e.g. `--type <TAB>`) for free. To enable it in bash, add this to your `~/.bashrc`:
+```bash
+eval "$(_SCANYE_COMPLETE=bash_source scanye)"
+```
+(zsh and fish are supported too — see [click's shell completion docs](https://click.palletsprojects.com/en/stable/shell-completion/) for the equivalent line.) Open a new terminal afterwards for it to take effect.
+
 ## Library Usage
 ```python
 from scanye.client import ScanyeClient
