@@ -560,7 +560,9 @@ def _prompt_transfer_date(client: ScanyeClient, invoice_ids: List[str]) -> Optio
         direction = "sales" if invoice.is_sales else "purchase"
         counterparty_label = "Client" if invoice.is_sales else "Seller"
         print(f"\n{invoice.invoice_no or 'N/A'} ({direction})    ID: {invoice.id}")
-        print(f"  {counterparty_label}: {invoice.counterparty_name or 'N/A'} (Tax No: {invoice.counterparty_tax_no or 'N/A'})")
+        name = invoice.counterparty_name or "N/A"
+        tax_no = invoice.counterparty_tax_no or "N/A"
+        print(f"  {counterparty_label}: {name} (Tax No: {tax_no})")
         print(f"  Issue date: {invoice.issue_date or 'N/A'}    Due date: {invoice.due_date or 'N/A'}")
         print(f"  Amount: {invoice.gross_amount or 'N/A'} {invoice.currency or ''}".rstrip())
         print(f"  Payment method: {invoice.payment_method or 'N/A'}")
@@ -824,9 +826,7 @@ def invoices_confirm(debug: bool, month: Optional[str], invoice_type: str, dry_r
 @invoices.command(name="mark-paid")
 @click.argument("invoice_ids", nargs=-1, required=True)
 @click.option("--date", help="Transfer order date (YYYY-MM-DD); skips the interactive prompt")
-@click.option(
-    "--auto-today", is_flag=True, help="Use today's date without prompting, instead of asking interactively"
-)
+@click.option("--auto-today", is_flag=True, help="Use today's date without prompting, instead of asking interactively")
 @click.pass_obj
 def invoices_mark_paid(debug: bool, invoice_ids: tuple, date: Optional[str], auto_today: bool) -> None:
     """Mark invoices as paid"""
