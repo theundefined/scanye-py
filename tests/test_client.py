@@ -4,7 +4,7 @@ import httpx
 import pytest
 import respx
 
-from scanye.client import ScanyeClient
+from scanye.client import ScanyeClient, iter_document_fields
 from scanye.exceptions import ScanyeAuthError, ScanyeRequestError
 
 
@@ -293,3 +293,150 @@ def test_create_printout_server_error():
     client = ScanyeClient(token="test-token")
     with pytest.raises(ScanyeRequestError):
         client.create_printout(["invoice-1"])
+
+
+@respx.mock
+def test_fetch_binders_success():
+    route = respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+        return_value=httpx.Response(200, json={"items": [{"id": "binder-1", "name": "images-1.jpg", "artifacts": []}]})
+    )
+
+    client = ScanyeClient(token="test-token")
+    binders = client.fetch_binders("2026-08")
+
+    assert binders == [{"id": "binder-1", "name": "images-1.jpg", "artifacts": []}]
+    body = json.loads(route.calls.last.request.content)
+    assert body["filters"] == [{"kind": "AccountingPeriod", "value": {"month": "2026-08", "kind": "MonthFilter"}}]
+    assert route.calls.last.request.headers["x-page-path"] == "/inbox"
+
+
+@respx.mock
+def test_get_invoice_data_success():
+    route = respx.get("https://api.scanye.pl/invoices/invoice-1/data").mock(
+        return_value=httpx.Response(200, json={"invoiceNo": {"value": "123"}})
+    )
+
+    client = ScanyeClient(token="test-token")
+    data = client.get_invoice_data("invoice-1")
+
+    assert data == {"invoiceNo": {"value": "123"}}
+    assert route.calls.last.request.url.params["with-probabilities"] == "false"
+    assert route.calls.last.request.url.params["with-locations"] == "true"
+
+
+@respx.mock
+def test_confirm_invoice_success():
+    respx.get("https://api.scanye.pl/invoices/invoice-1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "invoice-1",
+                "data": {"accounting": {"sales": {"value": "false"}}},
+                "annotations": {"accountingMonth": "2026-08"},
+                "linkedArtifacts": [],
+            },
+        )
+    )
+    respx.get("https://api.scanye.pl/invoices/invoice-1/data").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "invoiceNo": {"value": "123"},
+                "accounting": {"sales": {"value": "false"}, "deduction": {}, "accountRows": []},
+                "items": [],
+            },
+        )
+    )
+    confirm_route = respx.post("https://api.scanye.pl/invoices/invoice-1/confirm").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    client = ScanyeClient(token="test-token")
+    result = client.confirm_invoice("invoice-1")
+
+    assert result is True
+    body = json.loads(confirm_route.calls.last.request.content)
+    # Empty placeholder fields from the /data response must be pruned before sending.
+    assert body == {
+        "data": {"invoiceNo": {"value": "123"}, "accounting": {"sales": {"value": "false"}}},
+        "annotations": {"accountingMonth": "2026-08"},
+        "linkedArtifacts": [],
+    }
+    assert confirm_route.calls.last.request.headers["x-form-old-version"] == "false"
+
+
+@respx.mock
+def test_download_invoice_page_success():
+    respx.get("https://api.scanye.pl/invoices/invoice-1/pages/1").mock(
+        return_value=httpx.Response(200, content=b"jpeg-bytes", headers={"content-type": "image/jpeg"})
+    )
+
+    client = ScanyeClient(token="test-token")
+    content, content_type = client.download_invoice_page("invoice-1")
+
+    assert content == b"jpeg-bytes"
+    assert content_type == "image/jpeg"
+
+
+def test_iter_document_fields_skips_own_side_and_locations():
+    data = {
+        "invoiceNo": {"value": "123", "location": {"page": 1, "x0": 0, "y0": 0, "x1": 0, "y1": 0}},
+        "payer": {"name": {"value": "Own Company"}},
+        "payee": {"name": {"value": "Vendor"}, "taxNo": {"value": "999"}},
+        "amountsPerRate": [{"gross": {"value": "10.00"}}, {"gross": {"value": "20.00"}}],
+    }
+
+    # Purchase invoice (is_sales=False): "payer" is the account's own company, skipped.
+    fields = dict(iter_document_fields(data, is_sales=False))
+    assert fields == {
+        ("invoiceNo",): "123",
+        ("payee", "name"): "Vendor",
+        ("payee", "taxNo"): "999",
+        ("amountsPerRate", 0, "gross"): "10.00",
+        ("amountsPerRate", 1, "gross"): "20.00",
+    }
+
+    # Sales invoice (is_sales=True): "payee" is the account's own company, skipped instead.
+    fields_sales = dict(iter_document_fields(data, is_sales=True))
+    assert ("payer", "name") in fields_sales
+    assert ("payee", "name") not in fields_sales
+
+
+@respx.mock
+def test_confirm_invoice_applies_field_overrides():
+    respx.get("https://api.scanye.pl/invoices/invoice-1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "invoice-1",
+                "data": {"accounting": {"sales": {"value": "false"}}},
+                "annotations": {"accountingMonth": "2026-08"},
+                "linkedArtifacts": [],
+            },
+        )
+    )
+    respx.get("https://api.scanye.pl/invoices/invoice-1/data").mock(
+        return_value=httpx.Response(
+            200,
+            json={"invoiceNo": {"value": "WRONG", "location": {"page": 1, "x0": 0, "y0": 0, "x1": 0, "y1": 0}}},
+        )
+    )
+    confirm_route = respx.post("https://api.scanye.pl/invoices/invoice-1/confirm").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    client = ScanyeClient(token="test-token")
+    client.confirm_invoice("invoice-1", field_overrides={("invoiceNo",): "CORRECTED"})
+
+    body = json.loads(confirm_route.calls.last.request.content)
+    # The override replaces the field entirely, dropping its now-stale OCR location.
+    assert body["data"]["invoiceNo"] == {"value": "CORRECTED"}
+
+
+@respx.mock
+def test_confirm_invoice_not_found():
+    respx.get("https://api.scanye.pl/invoices/missing-invoice").mock(return_value=httpx.Response(404))
+
+    client = ScanyeClient(token="test-token")
+    with pytest.raises(ScanyeRequestError):
+        client.confirm_invoice("missing-invoice")

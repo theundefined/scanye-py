@@ -24,6 +24,60 @@ def _parse_invoice_list(res_data: Any) -> List[Invoice]:
     return []
 
 
+def iter_document_fields(data: Dict[str, Any], is_sales: bool) -> Any:
+    """
+    Yields (path, value) for every editable leaf field in a GET .../data response (each such
+    leaf is a {"value": ..., "location"?: ...} dict) -- for the confirm review's "edit all
+    fields" walkthrough. `path` is a tuple of str (dict key) / int (list index) segments, e.g.
+    ("dates", "issue") or ("amountsPerRate", 0, "gross"), usable directly with
+    ScanyeClient.confirm_invoice()'s field_overrides.
+
+    Skips the side of payer/payee that represents the account's own company (not something
+    OCR extracted from the document, so not meaningful to "correct") -- payee on a sales
+    invoice, payer on a purchase one, mirroring Invoice.from_dict()'s counterparty selection.
+    """
+    self_key = "payee" if is_sales else "payer"
+    yield from _iter_leaf_fields(data, self_key, ())
+
+
+def _iter_leaf_fields(node: Any, self_key: str, path: Tuple[Any, ...]) -> Any:
+    if isinstance(node, dict):
+        if "value" in node and not isinstance(node["value"], (dict, list)):
+            yield path, node["value"]
+            return
+        for key, value in node.items():
+            if key == "location" or (not path and key == self_key):
+                continue
+            yield from _iter_leaf_fields(value, self_key, path + (key,))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _iter_leaf_fields(item, self_key, path + (index,))
+
+
+def _apply_field_overrides(data: Dict[str, Any], overrides: Dict[Tuple[Any, ...], str]) -> None:
+    for path, value in overrides.items():
+        node = data
+        for part in path[:-1]:
+            node = node[part]
+        node[path[-1]] = {"value": value}
+
+
+def _prune_empty(value: Any) -> Any:
+    """
+    Recursively drops empty dicts/lists/None. The GET .../data endpoint returns placeholder
+    fields (e.g. accounting.deduction: {}, items: []) that the web app's own confirm request
+    never includes — verified by diffing a captured browser confirm payload against a pruned
+    GET .../data response for the same invoice; they matched key-for-key.
+    """
+    if isinstance(value, dict):
+        pruned = {k: _prune_empty(v) for k, v in value.items()}
+        return {k: v for k, v in pruned.items() if v not in ({}, [], None)}
+    if isinstance(value, list):
+        items = [_prune_empty(v) for v in value]
+        return [v for v in items if v not in ({}, [], None)]
+    return value
+
+
 class ScanyeClient:
     BASE_URL = "https://api.scanye.pl"
 
@@ -220,6 +274,106 @@ class ScanyeClient:
             raise
         except Exception as e:
             raise ScanyeRequestError(f"Failed to fetch invoice {invoice_id}: {e}") from e
+
+    def fetch_binders(self, month: str) -> List[Dict[str, Any]]:
+        """
+        Fetches "binders" (grouped documents) for an accounting month via the same endpoint
+        that powers the web app's /inbox page. Each binder wraps one or more "artifacts"
+        (documents); an artifact whose dateAuthenticated is None is still pending review and
+        won't show up via fetch_invoices() until confirm_invoice() is called on it. A binder
+        can also wrap non-invoice documents (bank statements, etc.) — check artifactType.
+        """
+        url = "/binders/entrepreneur/fetch"
+        extra_headers = {"x-page-path": "/inbox"}
+        data = {
+            "limit": 1000,
+            "offset": 0,
+            "filters": [{"kind": "AccountingPeriod", "value": {"month": month, "kind": "MonthFilter"}}],
+            "sorts": [{"subject": {"kind": "Name"}, "asc": True}],
+        }
+
+        try:
+            response = self._authenticated_request("POST", url, json=data, extra_headers=extra_headers)
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, dict):
+                items = result.get("items", [])
+                return items if isinstance(items, list) else []
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to fetch binders for {month}: {e}") from e
+
+    def get_invoice_data(self, invoice_id: str) -> Dict[str, Any]:
+        """
+        Fetches the OCR-extracted field data for an invoice, with each field's bounding-box
+        location on the source document. This is the shape needed for confirm_invoice()'s
+        request body — see _prune_empty().
+        """
+        url = f"/invoices/{invoice_id}/data"
+        params = {"with-probabilities": "false", "with-locations": "true"}
+        extra_headers = {"x-page-path": "/authentication/invoice"}
+
+        try:
+            response = self._authenticated_request("GET", url, params=params, extra_headers=extra_headers)
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to fetch invoice data for {invoice_id}: {e}") from e
+
+    def download_invoice_page(self, invoice_id: str, page: int = 1) -> Tuple[bytes, str]:
+        """
+        Downloads one page of an invoice's source image, as shown for manual review in the
+        web app. Returns (content, content_type) -- there's no content-disposition header
+        here to get a filename from, unlike the /printouts endpoints.
+        """
+        url = f"/invoices/{invoice_id}/pages/{page}"
+        try:
+            response = self._authenticated_request("GET", url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            return response.content, content_type
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to download page {page} of invoice {invoice_id}: {e}") from e
+
+    def confirm_invoice(self, invoice_id: str, field_overrides: Optional[Dict[Tuple[Any, ...], str]] = None) -> bool:
+        """
+        Confirms a scanned/uploaded invoice that is still pending review in the inbox, moving
+        it into the normal invoice list. Submits the invoice's own OCR-extracted data and its
+        existing annotations/linkedArtifacts unchanged, except for any corrections given via
+        field_overrides -- a mapping from a field's path (as yielded by iter_document_fields(),
+        e.g. {("invoiceNo",): "FV/123", ("amounts", "gross"): "100.00"}) to its corrected value.
+        An overridden field's location (the OCR bounding box) is dropped, since a manually
+        corrected value no longer corresponds to one -- confirmed safe against a real captured
+        confirm payload, where at least one field (paymentMethod) was already sent without a
+        location and accepted.
+
+        :param invoice_id: ID of the invoice (artifact) to confirm.
+        :param field_overrides: Corrected values for specific fields, keyed by path.
+        :return: True if successful.
+        """
+        invoice = self.get_invoice(invoice_id)
+        if invoice is None:
+            raise ScanyeRequestError(f"Invoice {invoice_id} not found")
+
+        data = _prune_empty(self.get_invoice_data(invoice_id))
+        if field_overrides:
+            _apply_field_overrides(data, field_overrides)
+        annotations = invoice.raw_data.get("annotations") or {}
+        linked_artifacts = invoice.raw_data.get("linkedArtifacts") or []
+
+        url = f"/invoices/{invoice_id}/confirm"
+        extra_headers = {"x-form-old-version": "false", "x-page-path": "/authentication/invoice"}
+        body = {"data": data, "annotations": annotations, "linkedArtifacts": linked_artifacts}
+
+        try:
+            response = self._authenticated_request("POST", url, json=body, extra_headers=extra_headers)
+            response.raise_for_status()
+            return True
+        except ScanyeError:
+            raise
+        except Exception as e:
+            raise ScanyeRequestError(f"Failed to confirm invoice {invoice_id}: {e}") from e
 
     def mark_as_paid(self, invoice_ids: List[str], transfer_date: Optional[str] = None) -> bool:
         """
