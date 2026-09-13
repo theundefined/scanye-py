@@ -414,3 +414,344 @@ def test_handle_invoices_download_rejects_ids_with_month(tmp_path, monkeypatch):
     kwargs = _download_kwargs(tmp_path, invoice_ids=["invoice-1"], month=["2026-07"])
     with pytest.raises(SystemExit):
         cli.handle_invoices_download(**kwargs)
+
+
+def _binders_response(pending_ids, non_invoice_ids=()):
+    return {
+        "items": [
+            {
+                "artifacts": [{"id": pid, "artifactType": "Invoice", "dateAuthenticated": None} for pid in pending_ids]
+                + [{"id": nid, "artifactType": "Document", "dateAuthenticated": None} for nid in non_invoice_ids]
+                + [{"id": "already-confirmed", "artifactType": "Invoice", "dateAuthenticated": "2026-08-01T00:00:00"}],
+            }
+        ]
+    }
+
+
+def _invoice_payload(invoice_id, is_sales=False):
+    return {
+        "id": invoice_id,
+        "data": {
+            "invoiceNo": {"value": f"FV/{invoice_id}"},
+            "accounting": {"sales": {"value": "true" if is_sales else "false"}},
+            "payee": {"name": {"value": "Seller Sp. z o.o."}},
+            "dates": {"issue": {"value": "05.08.2026"}},
+            "amounts": {"gross": {"value": "100.00"}},
+            "currency": {"value": "PLN"},
+        },
+        "annotations": {"accountingMonth": "2026-08"},
+        "linkedArtifacts": [],
+    }
+
+
+def test_handle_invoices_confirm_enter_confirms_invoice(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1/data").mock(
+            return_value=httpx.Response(200, json={"invoiceNo": {"value": "FV/pending-1"}})
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    assert confirm_route.called
+    out = capsys.readouterr().out
+    assert "FV/pending-1" in out
+    assert "ID: pending-1" in out
+    assert "1 confirmed, 0 skipped." in out
+
+
+def test_handle_invoices_confirm_view_opens_document_then_reprompts(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    answers = iter(["v", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    opened_paths = []
+    monkeypatch.setattr(cli, "_open_file", lambda path: opened_paths.append(path))
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        payload = _invoice_payload("pending-1")
+        payload["numPages"] = 1
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(return_value=httpx.Response(200, json=payload))
+        respx.get("https://api.scanye.pl/invoices/pending-1/pages/1").mock(
+            return_value=httpx.Response(200, content=b"jpeg-bytes", headers={"content-type": "image/jpeg"})
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1/data").mock(
+            return_value=httpx.Response(200, json={"invoiceNo": {"value": "FV/pending-1"}})
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    assert confirm_route.called
+    assert len(opened_paths) == 1
+    assert opened_paths[0].read_bytes() == b"jpeg-bytes"
+
+
+def test_handle_invoices_confirm_edit_overrides_a_field(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    # "e" enters edit mode; "FV/CORRECTED" overrides invoiceNo; "" keeps payee.name unchanged;
+    # the walkthrough then ends and "" on the main prompt confirms.
+    answers = iter(["e", "FV/CORRECTED", "", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1/data").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "invoiceNo": {"value": "WRONG-NO"},
+                    "payee": {"name": {"value": "Seller Sp. z o.o."}},
+                },
+            )
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    body = json.loads(confirm_route.calls.last.request.content)
+    assert body["data"]["invoiceNo"]["value"] == "FV/CORRECTED"
+    assert body["data"]["payee"]["name"]["value"] == "Seller Sp. z o.o."
+
+
+def test_handle_invoices_confirm_edit_amounts_suggests_vat_due_and_per_rate(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    # "e" enters edit mode; typing gross and net, then "" (Enter) for every other amount field
+    # accepts the auto-computed vat/due and the single-rate amountsPerRate suggestions.
+    answers = iter(["e", "110.29", "89.67", "", "", "", "", "", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1/data").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "amounts": {
+                        "gross": {"value": "23.00"},
+                        "net": {"value": "23.00"},
+                        "vat": {"value": "0.00"},
+                        "due": {"value": "23.00"},
+                    },
+                    "amountsPerRate": [
+                        {
+                            "gross": {"value": "23.00"},
+                            "net": {"value": "23.00"},
+                            "vat": {"value": "0.00"},
+                        }
+                    ],
+                },
+            )
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    body = json.loads(confirm_route.calls.last.request.content)
+    amounts = body["data"]["amounts"]
+    assert amounts["gross"]["value"] == "110.29"
+    assert amounts["net"]["value"] == "89.67"
+    assert amounts["vat"]["value"] == "20.62"
+    assert amounts["due"]["value"] == "110.29"
+    per_rate = body["data"]["amountsPerRate"][0]
+    assert per_rate["gross"]["value"] == "110.29"
+    assert per_rate["net"]["value"] == "89.67"
+    assert per_rate["vat"]["value"] == "20.62"
+
+
+def test_handle_invoices_confirm_list_only_does_not_prompt_or_confirm(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    def _no_input(prompt):
+        raise AssertionError("--list must not prompt")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm")
+        confirm_route.mock(return_value=httpx.Response(200, json={}))
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=True, debug=False)
+
+    assert not confirm_route.called
+    out = capsys.readouterr().out
+    assert "pending-1" in out
+    assert "FV/pending-1" in out
+
+
+def test_handle_invoices_confirm_skip_and_quit(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    answers = iter(["s", "q"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1", "pending-2"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-2").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-2"))
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm")
+        confirm_route.mock(return_value=httpx.Response(200, json={}))
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    assert not confirm_route.called
+
+
+def test_handle_invoices_confirm_skips_non_invoice_documents(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=[], non_invoice_ids=["doc-1"]))
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    out = capsys.readouterr().out
+    assert "No invoices pending confirmation" in out
+    assert "1 non-invoice document(s)" in out
+
+
+def test_handle_invoices_confirm_filters_by_type(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1", is_sales=True))
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        cli.handle_invoices_confirm(
+            month="2026-08", invoice_type="purchase", dry_run=False, list_only=False, debug=False
+        )
+
+    assert not confirm_route.called
+
+
+def test_handle_invoices_confirm_skips_deleted_artifacts(tmp_path, monkeypatch, capsys):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+
+    binders = {
+        "items": [
+            {
+                "dateDeleted": None,
+                "artifacts": [
+                    {
+                        "id": "trashed-1",
+                        "artifactType": "Invoice",
+                        "dateAuthenticated": None,
+                        "dateDeleted": "2026-08-02T00:00:00",
+                    }
+                ],
+            }
+        ]
+    }
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=binders)
+        )
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=False, list_only=False, debug=False)
+
+    assert "No invoices pending confirmation" in capsys.readouterr().out
+
+
+def test_handle_invoices_confirm_dry_run_does_not_call_api(tmp_path, monkeypatch):
+    config_dir = tmp_path / "scanye"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "config.json")
+    cli.save_config({"token": "test-token"})
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    with respx.mock:
+        respx.post("https://api.scanye.pl/binders/entrepreneur/fetch").mock(
+            return_value=httpx.Response(200, json=_binders_response(pending_ids=["pending-1"]))
+        )
+        respx.get("https://api.scanye.pl/invoices/pending-1").mock(
+            return_value=httpx.Response(200, json=_invoice_payload("pending-1"))
+        )
+        confirm_route = respx.post("https://api.scanye.pl/invoices/pending-1/confirm")
+        confirm_route.mock(return_value=httpx.Response(200, json={}))
+
+        cli.handle_invoices_confirm(month="2026-08", invoice_type="all", dry_run=True, list_only=False, debug=False)
+
+    assert not confirm_route.called

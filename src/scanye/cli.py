@@ -1,17 +1,21 @@
 import io
 import json
+import mimetypes
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from getpass import getpass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import click
 
-from .client import ScanyeClient
+from .client import ScanyeClient, iter_document_fields
 from .exceptions import ScanyeError
 from .models import Invoice
 
@@ -267,13 +271,333 @@ def handle_invoices_show(invoice_id: str, debug: bool) -> None:
         persist_token(config, client)
 
 
-def handle_invoices_mark_paid(invoice_ids: List[str], date: Optional[str], debug: bool) -> None:
+def _pending_invoice_ids(binders: List[dict]) -> tuple:
+    """
+    Returns (pending_ids, skipped_non_invoice_count) from a fetch_binders() result: artifacts
+    that are invoices, not yet authenticated (confirmed), and not deleted.
+    """
+    pending_ids: List[str] = []
+    skipped_non_invoice = 0
+    for binder in binders:
+        if binder.get("dateDeleted"):
+            continue
+        for artifact in binder.get("artifacts", []):
+            if artifact.get("dateAuthenticated") or artifact.get("dateDeleted"):
+                continue
+            if artifact.get("artifactType") != "Invoice":
+                skipped_non_invoice += 1
+                continue
+            pending_ids.append(artifact["id"])
+    return pending_ids, skipped_non_invoice
+
+
+def _print_pending_invoices(client: ScanyeClient, pending_ids: List[str], invoice_type: str) -> None:
+    header = f"{'ID':<38} | {'Date':<10} | {'Type':<8} | {'Inv No':<15} | {'Gross':<10} | {'Seller/Client'}"
+    rows = []
+    for invoice_id in pending_ids:
+        invoice = client.get_invoice(invoice_id)
+        if invoice is None:
+            continue
+        if invoice_type != "all" and invoice.is_sales != (invoice_type == "sales"):
+            continue
+        rows.append(invoice)
+
+    if not rows:
+        print("No matching invoices.")
+        return
+
+    print(header)
+    print("-" * len(header))
+    for inv in rows:
+        direction = "sales" if inv.is_sales else "purchase"
+        currency = f" {inv.currency}" if inv.currency else ""
+        gross = f"{inv.gross_amount or 'N/A'}{currency}"
+        counterparty = (inv.counterparty_name or "")[:40]
+        p1 = f"{inv.id:<38} | {inv.issue_date or 'N/A':<10} | {direction:<8} | "
+        p2 = f"{inv.invoice_no or 'N/A':<15} | {gross:<10} | {counterparty}"
+        print(p1 + p2)
+
+
+def _open_file(path: Path) -> None:
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=False)
+    elif sys.platform == "win32":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
+
+
+def _view_invoice_document(client: ScanyeClient, invoice: Invoice) -> None:
+    num_pages = invoice.raw_data.get("numPages") or 1
+    tmp_dir = Path(tempfile.gettempdir()) / "scanye-invoice-pages"
+    tmp_dir.mkdir(exist_ok=True)
+
+    try:
+        for page in range(1, num_pages + 1):
+            content, content_type = client.download_invoice_page(invoice.id, page)
+            ext = mimetypes.guess_extension(content_type) or ".bin"
+            path = tmp_dir / f"{invoice.id}-p{page}{ext}"
+            path.write_bytes(content)
+            print(f"  Saved page {page} to {path} (opening...)")
+            _open_file(path)
+    except ScanyeError as e:
+        print(f"  Could not load the document: {e}")
+
+
+def _format_field_path(path: Tuple[Any, ...]) -> str:
+    parts: List[str] = []
+    for part in path:
+        if isinstance(part, int):
+            parts[-1] += f"[{part + 1}]"
+        else:
+            parts.append(str(part))
+    return ".".join(parts)
+
+
+_AMOUNT_KEYS = ("gross", "net", "vat", "due")
+
+
+def _amount_group_key(path: Tuple[Any, ...]) -> Optional[Tuple[Any, ...]]:
+    """
+    Path's parent if this leaf belongs to an amounts-like group -- the invoice-level `amounts`
+    object, or a single entry of the `amountsPerRate` list -- else None.
+    """
+    if len(path) >= 2 and path[-1] in _AMOUNT_KEYS:
+        parent = path[:-1]
+        if parent == ("amounts",) or (len(parent) == 2 and parent[0] == "amountsPerRate"):
+            return parent
+    return None
+
+
+def _reorder_amount_groups(fields: List[Tuple[Tuple[Any, ...], Any]]) -> List[Tuple[Tuple[Any, ...], Any]]:
+    """
+    Moves each amounts-like group's fields together, in gross/net/vat/due order, at the position
+    of the group's first field -- gross and net are what's actually worth typing, so they must
+    come before vat/due (and, for a single-rate invoice, before amountsPerRate) for those to be
+    auto-suggested from them.
+    """
+    groups: Dict[Tuple[Any, ...], Dict[str, Tuple[Tuple[Any, ...], Any]]] = {}
+    for path, value in fields:
+        group = _amount_group_key(path)
+        if group is not None:
+            groups.setdefault(group, {})[path[-1]] = (path, value)
+
+    emitted: Set[Tuple[Any, ...]] = set()
+    result: List[Tuple[Tuple[Any, ...], Any]] = []
+    for path, value in fields:
+        group = _amount_group_key(path)
+        if group is None:
+            result.append((path, value))
+            continue
+        if group in emitted:
+            continue
+        emitted.add(group)
+        for key in _AMOUNT_KEYS:
+            if key in groups[group]:
+                result.append(groups[group][key])
+    return result
+
+
+def _compute_derived_amount(key: str, context: Dict[str, str]) -> Optional[str]:
+    try:
+        if key == "vat" and "gross" in context and "net" in context:
+            gross = Decimal(context["gross"])
+            net = Decimal(context["net"])
+            return str((gross - net).quantize(Decimal("0.01")))
+        if key == "due" and "gross" in context:
+            return context["gross"]
+    except InvalidOperation:
+        return None
+    return None
+
+
+def _edit_invoice_fields(data: Dict[str, Any], is_sales: bool, overrides: Dict[Tuple[Any, ...], str]) -> None:
+    print("  Reviewing every field -- Enter keeps the current value, 'q' stops early.")
+    print("  Amounts: enter gross/net -- vat/due (and a single VAT rate's amounts) get suggested from them.")
+    fields = _reorder_amount_groups(list(iter_document_fields(data, is_sales)))
+    per_rate_groups = {
+        group for path, _ in fields if (group := _amount_group_key(path)) is not None and group[0] == "amountsPerRate"
+    }
+    single_rate = len(per_rate_groups) == 1
+
+    context: Dict[Tuple[Any, ...], Dict[str, str]] = {}
+    for path, current_value in fields:
+        group = _amount_group_key(path)
+        key = path[-1] if group is not None else None
+        shown = overrides.get(path, current_value)
+
+        if group is not None and key is not None and path not in overrides:
+            top = context.get(("amounts",), {})
+            if single_rate and group != ("amounts",) and key in top:
+                shown = top[key]
+            else:
+                computed = _compute_derived_amount(key, context.get(group, {}))
+                if computed is not None:
+                    shown = computed
+
+        answer = input(f"    {_format_field_path(path)} [{shown}]: ").strip()
+        if answer.lower() == "q":
+            return
+
+        effective = answer if answer else str(shown)
+        if group is not None and key is not None:
+            context.setdefault(group, {})[key] = effective
+        if answer:
+            overrides[path] = answer
+        elif group is not None and effective != str(current_value):
+            overrides[path] = effective
+
+
+def handle_invoices_confirm(
+    month: Optional[str], invoice_type: str, dry_run: bool, list_only: bool, debug: bool
+) -> None:
+    config = load_config()
+    require_credentials(config)
+
+    client = build_client(config, debug)
+    month = month or datetime.now().strftime("%Y-%m")
+
+    try:
+        binders = client.fetch_binders(month)
+        pending_ids, skipped_non_invoice = _pending_invoice_ids(binders)
+
+        if not pending_ids:
+            print(f"No invoices pending confirmation for {month}.")
+            if skipped_non_invoice:
+                print(f"({skipped_non_invoice} non-invoice document(s) in the inbox were skipped.)")
+            return
+
+        if list_only:
+            _print_pending_invoices(client, pending_ids, invoice_type)
+            if skipped_non_invoice:
+                print(f"\n({skipped_non_invoice} non-invoice document(s) in the inbox were skipped.)")
+            return
+
+        print(f"{len(pending_ids)} invoice(s) pending confirmation for {month}.")
+        if skipped_non_invoice:
+            print(f"({skipped_non_invoice} non-invoice document(s) in the inbox were skipped.)")
+
+        confirmed = 0
+        skipped = 0
+        for invoice_id in pending_ids:
+            invoice = client.get_invoice(invoice_id)
+            if invoice is None:
+                print(f"\n{invoice_id}: not found, skipping.")
+                skipped += 1
+                continue
+
+            if invoice_type != "all" and invoice.is_sales != (invoice_type == "sales"):
+                skipped += 1
+                continue
+
+            direction = "sales" if invoice.is_sales else "purchase"
+            counterparty_label = "Client" if invoice.is_sales else "Seller"
+            counterparty_key = "payer" if invoice.is_sales else "payee"
+
+            overrides: Dict[Tuple[Any, ...], str] = {}
+            document_data: Optional[Dict[str, Any]] = None
+
+            while True:
+                invoice_no = overrides.get(("invoiceNo",), invoice.invoice_no or "N/A")
+                date = overrides.get(("dates", "issue"), invoice.issue_date or "N/A")
+                gross = overrides.get(("amounts", "gross"), invoice.gross_amount or "N/A")
+                currency = overrides.get(("currency",), invoice.currency or "")
+                name = overrides.get((counterparty_key, "name"), invoice.counterparty_name or "N/A")
+                tax_no = overrides.get((counterparty_key, "taxNo"), invoice.counterparty_tax_no or "N/A")
+
+                print(f"\n{invoice_no} ({direction})    ID: {invoice.id}")
+                print(f"  Date: {date}    Amount: {gross} {currency}".rstrip())
+                print(f"  {counterparty_label}: {name} (Tax No: {tax_no})")
+                if overrides:
+                    print(f"  ({len(overrides)} field(s) edited)")
+
+                prompt = "  [Enter] confirm  /  s = skip  /  v = view document  /  e = edit fields  /  q = quit: "
+                answer = input(prompt).strip().lower()
+
+                if answer == "v":
+                    _view_invoice_document(client, invoice)
+                    continue
+                if answer == "e":
+                    if document_data is None:
+                        document_data = client.get_invoice_data(invoice_id)
+                    _edit_invoice_fields(document_data, invoice.is_sales, overrides)
+                    continue
+                break
+
+            if answer == "q":
+                break
+            if answer == "s":
+                skipped += 1
+                continue
+
+            if dry_run:
+                print("  (dry run, not confirmed)")
+            else:
+                client.confirm_invoice(invoice_id, field_overrides=overrides or None)
+                print("  Confirmed.")
+                confirmed += 1
+
+        suffix = " (dry run)" if dry_run else ""
+        print(f"\n{confirmed} confirmed{suffix}, {skipped} skipped.")
+    except ScanyeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        persist_token(config, client)
+
+
+def _prompt_transfer_date(client: ScanyeClient, invoice_ids: List[str]) -> Optional[str]:
+    """
+    Shows the relevant date fields for each invoice and asks for the payment (transfer order)
+    date to apply to all of them. Returns None if the user cancels.
+    """
+    for invoice_id in invoice_ids:
+        invoice = client.get_invoice(invoice_id)
+        if invoice is None:
+            print(f"{invoice_id}: not found")
+            continue
+
+        direction = "sales" if invoice.is_sales else "purchase"
+        counterparty_label = "Client" if invoice.is_sales else "Seller"
+        print(f"\n{invoice.invoice_no or 'N/A'} ({direction})    ID: {invoice.id}")
+        print(f"  {counterparty_label}: {invoice.counterparty_name or 'N/A'} (Tax No: {invoice.counterparty_tax_no or 'N/A'})")
+        print(f"  Issue date: {invoice.issue_date or 'N/A'}    Due date: {invoice.due_date or 'N/A'}")
+        print(f"  Amount: {invoice.gross_amount or 'N/A'} {invoice.currency or ''}".rstrip())
+        print(f"  Payment method: {invoice.payment_method or 'N/A'}")
+        if invoice.transfer_date:
+            print(f"  Already marked as paid on: {invoice.transfer_date}")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    while True:
+        answer = input(f"\nPayment date (YYYY-MM-DD, Enter = {today}, q = cancel): ").strip()
+        if answer.lower() == "q":
+            return None
+        if not answer:
+            return today
+        try:
+            datetime.strptime(answer, "%Y-%m-%d")
+            return answer
+        except ValueError:
+            print("Invalid date format, expected YYYY-MM-DD.")
+
+
+def handle_invoices_mark_paid(invoice_ids: List[str], date: Optional[str], auto_today: bool, debug: bool) -> None:
     config = load_config()
     require_credentials(config)
 
     client = build_client(config, debug)
     try:
-        client.mark_as_paid(invoice_ids, transfer_date=date)
+        if date:
+            transfer_date: Optional[str] = date
+        elif auto_today:
+            transfer_date = datetime.now().strftime("%Y-%m-%d")
+        else:
+            transfer_date = _prompt_transfer_date(client, invoice_ids)
+            if transfer_date is None:
+                print("Cancelled.")
+                return
+
+        client.mark_as_paid(invoice_ids, transfer_date=transfer_date)
         print(f"Successfully marked {len(invoice_ids)} invoices as paid.")
     except ScanyeError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -478,13 +802,35 @@ def invoices_show(debug: bool, invoice_id: str) -> None:
     handle_invoices_show(invoice_id, debug)
 
 
+@invoices.command(name="confirm")
+@click.option("--month", default=None, help="Accounting month to review (YYYY-MM). Default: current month")
+@click.option(
+    "--type",
+    "invoice_type",
+    type=click.Choice(["sales", "purchase", "all"]),
+    default="all",
+    help="Only review invoices of this type",
+)
+@click.option("--dry-run", is_flag=True, help="Show what would be confirmed without submitting anything")
+@click.option(
+    "--list", "list_only", is_flag=True, help="Just list invoices pending confirmation, without confirming any"
+)
+@click.pass_obj
+def invoices_confirm(debug: bool, month: Optional[str], invoice_type: str, dry_run: bool, list_only: bool) -> None:
+    """Step through invoices pending confirmation (inbox) one by one"""
+    handle_invoices_confirm(month=month, invoice_type=invoice_type, dry_run=dry_run, list_only=list_only, debug=debug)
+
+
 @invoices.command(name="mark-paid")
 @click.argument("invoice_ids", nargs=-1, required=True)
-@click.option("--date", help="Transfer order date (YYYY-MM-DD), defaults to today")
+@click.option("--date", help="Transfer order date (YYYY-MM-DD); skips the interactive prompt")
+@click.option(
+    "--auto-today", is_flag=True, help="Use today's date without prompting, instead of asking interactively"
+)
 @click.pass_obj
-def invoices_mark_paid(debug: bool, invoice_ids: tuple, date: Optional[str]) -> None:
+def invoices_mark_paid(debug: bool, invoice_ids: tuple, date: Optional[str], auto_today: bool) -> None:
     """Mark invoices as paid"""
-    handle_invoices_mark_paid(list(invoice_ids), date, debug)
+    handle_invoices_mark_paid(list(invoice_ids), date, auto_today, debug)
 
 
 @invoices.command(name="mark-unpaid")
